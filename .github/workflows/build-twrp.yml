@@ -1,4 +1,5 @@
-name: Build Rothko TWRP v3
+name: Build Rothko TWRP v4
+
 on:
   workflow_dispatch:
 
@@ -6,6 +7,7 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
+
     steps:
       - name: Free disk space
         run: |
@@ -26,7 +28,12 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git git-lfs gnupg gperf imagemagick lib32ncurses-dev lib32readline-dev lib32z1-dev libelf-dev liblz4-tool libncurses-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lz4 lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev python3 python-is-python3
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
+            git git-lfs gnupg gperf imagemagick lib32ncurses-dev lib32readline-dev \
+            lib32z1-dev libelf-dev liblz4-tool libncurses-dev libsdl1.2-dev \
+            libssl-dev libxml2 libxml2-utils lz4 lzop pngcrush rsync schedtool \
+            squashfs-tools xsltproc zip zlib1g-dev python3 python-is-python3
 
       - name: Install repo
         run: |
@@ -35,29 +42,79 @@ jobs:
           chmod +x "$HOME/bin/repo"
           echo "$HOME/bin" >> "$GITHUB_PATH"
 
-      - name: Init source
+      - name: Init TWRP 14.1 source
         run: |
           mkdir -p "$GITHUB_WORKSPACE/twrp"
           cd "$GITHUB_WORKSPACE/twrp"
-          repo init --depth=1 -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git -b twrp-14.1
+          repo init --depth=1 \
+            -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git \
+            -b twrp-14.1
 
       - name: Sync source
         run: |
           cd "$GITHUB_WORKSPACE/twrp"
           repo sync -c --no-clone-bundle --no-tags --optimized-fetch --prune -j2
 
-      - name: Clone Rothko tree
+      - name: Clone Rothko device tree
         run: |
           cd "$GITHUB_WORKSPACE/twrp"
           mkdir -p device/xiaomi
           rm -rf device/xiaomi/rothko
-          git clone --depth=1 -b twrp-14.1_a16 https://github.com/JonesqPacMan/android_device_xiaomi_rothko_twrp.git device/xiaomi/rothko
+          git clone --depth=1 \
+            -b twrp-14.1_a16 \
+            https://github.com/JonesqPacMan/android_device_xiaomi_rothko_twrp.git \
+            device/xiaomi/rothko
+
+      - name: Patch obsolete AIDL NDK platform module names
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE/twrp"
+
+          echo "=== BEFORE: obsolete -ndk_platform references ==="
+          grep -RIn --include='Android.bp' --include='Android.mk' \
+            --include='*.mk' --include='*.bp' \
+            -- '-ndk_platform' . > "$GITHUB_WORKSPACE/ndk-platform-before.txt" || true
+          cat "$GITHUB_WORKSPACE/ndk-platform-before.txt" || true
+
+          # Android's AIDL NDK backend migrated module names from
+          # *-ndk_platform to *-ndk.  The v3 failure was specifically:
+          # android.security.apc-ndk_platform.so.toc -> no known rule.
+          #
+          # Patch build-description files only; never touch source code,
+          # prebuilts, .repo metadata or output files.
+          while IFS= read -r -d '' f; do
+            if grep -q -- '-ndk_platform' "$f"; then
+              sed -i 's/-ndk_platform/-ndk/g' "$f"
+            fi
+          done < <(
+            find . \
+              -path './.repo' -prune -o \
+              -path './out' -prune -o \
+              -type f \( -name 'Android.bp' -o -name 'Android.mk' -o -name '*.mk' -o -name '*.bp' \) \
+              -print0
+          )
+
+          echo "=== AFTER: remaining obsolete references ==="
+          grep -RIn --exclude-dir=.repo --exclude-dir=out \
+            --include='Android.bp' --include='Android.mk' \
+            --include='*.mk' --include='*.bp' \
+            -- '-ndk_platform' . > "$GITHUB_WORKSPACE/ndk-platform-after.txt" || true
+          cat "$GITHUB_WORKSPACE/ndk-platform-after.txt" || true
+
+          echo "=== APC module definitions/references after patch ==="
+          grep -RIn --exclude-dir=.repo --exclude-dir=out \
+            --include='Android.bp' --include='Android.mk' \
+            -- 'android.security.apc-ndk' . \
+            > "$GITHUB_WORKSPACE/apc-after.txt" || true
+          cat "$GITHUB_WORKSPACE/apc-after.txt" || true
 
       - name: Build vendor_boot
         shell: bash
         run: |
           set -o pipefail
           exec > >(tee -a "$GITHUB_WORKSPACE/build.log") 2>&1
+
           cd "$GITHUB_WORKSPACE/twrp"
           export ALLOW_MISSING_DEPENDENCIES=true
           export USE_CCACHE=1
@@ -65,9 +122,11 @@ jobs:
           ccache -M 2G || true
           export NINJA_ARGS="-j1"
           export SOONG_UI_NINJA_ARGS="-j1"
+
           echo "=== PRE-BUILD MEMORY ==="
           free -h
           swapon --show || true
+
           source build/envsetup.sh
           lunch twrp_rothko-ap2a-eng
           echo "=== BUILD vendorbootimage (-j1) ==="
@@ -77,17 +136,29 @@ jobs:
         if: always()
         run: |
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
+
           cp "$GITHUB_WORKSPACE/build.log" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
+          cp "$GITHUB_WORKSPACE/ndk-platform-before.txt" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
+          cp "$GITHUB_WORKSPACE/ndk-platform-after.txt" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
+          cp "$GITHUB_WORKSPACE/apc-after.txt" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
+
           free -h > "$GITHUB_WORKSPACE/artifacts/memory.txt"
           swapon --show > "$GITHUB_WORKSPACE/artifacts/swap.txt" || true
           df -h > "$GITHUB_WORKSPACE/artifacts/disk.txt"
+
           OUT="$GITHUB_WORKSPACE/twrp/out/target/product/rothko"
           if [ -d "$OUT" ]; then
-            find "$OUT" -maxdepth 3 -type f \( -name 'vendor_boot.img' -o -name 'recovery.img' -o -name '*ramdisk*' -o -name '*.cpio' -o -name '*.lz4' \) -print > "$GITHUB_WORKSPACE/artifacts/output-files.txt" || true
+            find "$OUT" -maxdepth 4 -type f \
+              \( -name 'vendor_boot.img' -o -name 'recovery.img' -o \
+                 -name '*ramdisk*' -o -name '*.cpio' -o -name '*.lz4' \) \
+              -print > "$GITHUB_WORKSPACE/artifacts/output-files.txt" || true
+
             if [ -f "$OUT/vendor_boot.img" ]; then
               cp "$OUT/vendor_boot.img" "$GITHUB_WORKSPACE/artifacts/"
-              sha256sum "$OUT/vendor_boot.img" > "$GITHUB_WORKSPACE/artifacts/SHA256SUMS.txt"
-              stat "$OUT/vendor_boot.img" > "$GITHUB_WORKSPACE/artifacts/vendor_boot-stat.txt"
+              sha256sum "$OUT/vendor_boot.img" \
+                > "$GITHUB_WORKSPACE/artifacts/SHA256SUMS.txt"
+              stat "$OUT/vendor_boot.img" \
+                > "$GITHUB_WORKSPACE/artifacts/vendor_boot-stat.txt"
             fi
           fi
 
@@ -95,7 +166,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rothko-twrp-build-v3
+          name: rothko-twrp-build-v4
           path: artifacts/
           if-no-files-found: warn
           retention-days: 7
