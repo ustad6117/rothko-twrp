@@ -1,4 +1,4 @@
-name: Build Rothko TWRP
+name: Build Rothko TWRP v2
 
 on:
   workflow_dispatch:
@@ -48,32 +48,45 @@ jobs:
         run: |
           cd "$GITHUB_WORKSPACE/twrp"
           mkdir -p device/xiaomi
+          rm -rf device/xiaomi/rothko
           git clone --depth=1 \
             -b twrp-14.1_a16 \
             https://github.com/JonesqPacMan/android_device_xiaomi_rothko_twrp.git \
             device/xiaomi/rothko
+
           echo "=== AndroidProducts.mk ==="
           cat device/xiaomi/rothko/AndroidProducts.mk
-          echo "=== BoardConfig recovery/vendor_boot flags ==="
-          grep -Ei 'RECOVERY|VENDOR_BOOT|RAMDISK|HEADER_VERSION|PAGE_SIZE|DTB' \
-            device/xiaomi/rothko/BoardConfig.mk || true
+          echo "=== twrp_rothko.mk ==="
+          cat device/xiaomi/rothko/twrp_rothko.mk
 
-      - name: Build vendor_boot
+      - name: Configure and build vendor_boot
         shell: bash
         run: |
           set -o pipefail
+          exec > >(tee -a "$GITHUB_WORKSPACE/build.log") 2>&1
+
           cd "$GITHUB_WORKSPACE/twrp"
           export ALLOW_MISSING_DEPENDENCIES=true
           export USE_CCACHE=1
           export CCACHE_EXEC=/usr/bin/ccache
           ccache -M 8G || true
+
           source build/envsetup.sh
 
-          # The Rothko tree uses the modern twrp_ product naming.
-          lunch twrp_rothko-eng
+          echo "=== lunch help ==="
+          lunch --help || true
 
-          # Rothko recovery lives in vendor_boot.
-          mka vendorbootimage -j2 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          echo "=== products containing rothko ==="
+          list_products 2>/dev/null | grep -i rothko || true
+
+          echo "=== available releases for twrp_rothko ==="
+          list_releases twrp_rothko || true
+
+          echo "=== selecting Android 14 TWRP release config: ap2a ==="
+          lunch twrp_rothko-ap2a-eng
+
+          echo "=== BUILDING vendorbootimage ==="
+          mka vendorbootimage -j2
 
       - name: Collect artifacts
         if: always()
@@ -83,7 +96,7 @@ jobs:
 
           OUT="$GITHUB_WORKSPACE/twrp/out/target/product/rothko"
           if [ -d "$OUT" ]; then
-            find "$OUT" -maxdepth 2 -type f \
+            find "$OUT" -maxdepth 3 -type f \
               \( -name 'vendor_boot.img' -o -name 'recovery.img' -o \
                  -name '*ramdisk*' -o -name '*.cpio' -o -name '*.lz4' \) \
               -print -exec cp -L {} "$GITHUB_WORKSPACE/artifacts/" \; || true
@@ -96,11 +109,11 @@ jobs:
 
           df -h > "$GITHUB_WORKSPACE/artifacts/disk-usage.txt"
 
-      - name: Upload result
+      - name: Upload result and logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rothko-twrp-build
+          name: rothko-twrp-build-v2
           path: artifacts/
           if-no-files-found: warn
           retention-days: 7
