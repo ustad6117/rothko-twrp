@@ -1,0 +1,106 @@
+name: Build Rothko TWRP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc || true
+          df -h
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
+            git git-lfs gnupg gperf imagemagick lib32ncurses-dev lib32readline-dev \
+            lib32z1-dev libelf-dev liblz4-tool libncurses-dev libsdl1.2-dev \
+            libssl-dev libxml2 libxml2-utils lz4 lzop pngcrush rsync schedtool \
+            squashfs-tools xsltproc zip zlib1g-dev python3 python-is-python3
+
+      - name: Install repo
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/bin/repo"
+          chmod +x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Init TWRP 14.1 source
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/twrp"
+          cd "$GITHUB_WORKSPACE/twrp"
+          repo init --depth=1 \
+            -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git \
+            -b twrp-14.1
+
+      - name: Sync source
+        run: |
+          cd "$GITHUB_WORKSPACE/twrp"
+          repo sync -c --no-clone-bundle --no-tags --optimized-fetch --prune -j2
+
+      - name: Clone Rothko device tree
+        run: |
+          cd "$GITHUB_WORKSPACE/twrp"
+          mkdir -p device/xiaomi
+          git clone --depth=1 \
+            -b twrp-14.1_a16 \
+            https://github.com/JonesqPacMan/android_device_xiaomi_rothko_twrp.git \
+            device/xiaomi/rothko
+          echo "=== AndroidProducts.mk ==="
+          cat device/xiaomi/rothko/AndroidProducts.mk
+          echo "=== BoardConfig recovery/vendor_boot flags ==="
+          grep -Ei 'RECOVERY|VENDOR_BOOT|RAMDISK|HEADER_VERSION|PAGE_SIZE|DTB' \
+            device/xiaomi/rothko/BoardConfig.mk || true
+
+      - name: Build vendor_boot
+        shell: bash
+        run: |
+          set -o pipefail
+          cd "$GITHUB_WORKSPACE/twrp"
+          export ALLOW_MISSING_DEPENDENCIES=true
+          export USE_CCACHE=1
+          export CCACHE_EXEC=/usr/bin/ccache
+          ccache -M 8G || true
+          source build/envsetup.sh
+
+          # The Rothko tree uses the modern twrp_ product naming.
+          lunch twrp_rothko-eng
+
+          # Rothko recovery lives in vendor_boot.
+          mka vendorbootimage -j2 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: Collect artifacts
+        if: always()
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          cp "$GITHUB_WORKSPACE/build.log" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
+
+          OUT="$GITHUB_WORKSPACE/twrp/out/target/product/rothko"
+          if [ -d "$OUT" ]; then
+            find "$OUT" -maxdepth 2 -type f \
+              \( -name 'vendor_boot.img' -o -name 'recovery.img' -o \
+                 -name '*ramdisk*' -o -name '*.cpio' -o -name '*.lz4' \) \
+              -print -exec cp -L {} "$GITHUB_WORKSPACE/artifacts/" \; || true
+
+            if [ -f "$OUT/vendor_boot.img" ]; then
+              sha256sum "$OUT/vendor_boot.img" | tee "$GITHUB_WORKSPACE/artifacts/SHA256SUMS.txt"
+              stat "$OUT/vendor_boot.img" | tee "$GITHUB_WORKSPACE/artifacts/vendor_boot-stat.txt"
+            fi
+          fi
+
+          df -h > "$GITHUB_WORKSPACE/artifacts/disk-usage.txt"
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rothko-twrp-build
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 7
