@@ -1,5 +1,4 @@
-name: Build Rothko TWRP v2
-
+name: Build Rothko TWRP v3
 on:
   workflow_dispatch:
 
@@ -7,22 +6,27 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
-
     steps:
       - name: Free disk space
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc || true
           df -h
+          free -h
+
+      - name: Add 12G swap
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+          swapon --show
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
-            git git-lfs gnupg gperf imagemagick lib32ncurses-dev lib32readline-dev \
-            lib32z1-dev libelf-dev liblz4-tool libncurses-dev libsdl1.2-dev \
-            libssl-dev libxml2 libxml2-utils lz4 lzop pngcrush rsync schedtool \
-            squashfs-tools xsltproc zip zlib1g-dev python3 python-is-python3
+          sudo apt-get install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git git-lfs gnupg gperf imagemagick lib32ncurses-dev lib32readline-dev lib32z1-dev libelf-dev liblz4-tool libncurses-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lz4 lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev python3 python-is-python3
 
       - name: Install repo
         run: |
@@ -31,89 +35,67 @@ jobs:
           chmod +x "$HOME/bin/repo"
           echo "$HOME/bin" >> "$GITHUB_PATH"
 
-      - name: Init TWRP 14.1 source
+      - name: Init source
         run: |
           mkdir -p "$GITHUB_WORKSPACE/twrp"
           cd "$GITHUB_WORKSPACE/twrp"
-          repo init --depth=1 \
-            -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git \
-            -b twrp-14.1
+          repo init --depth=1 -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git -b twrp-14.1
 
       - name: Sync source
         run: |
           cd "$GITHUB_WORKSPACE/twrp"
           repo sync -c --no-clone-bundle --no-tags --optimized-fetch --prune -j2
 
-      - name: Clone Rothko device tree
+      - name: Clone Rothko tree
         run: |
           cd "$GITHUB_WORKSPACE/twrp"
           mkdir -p device/xiaomi
           rm -rf device/xiaomi/rothko
-          git clone --depth=1 \
-            -b twrp-14.1_a16 \
-            https://github.com/JonesqPacMan/android_device_xiaomi_rothko_twrp.git \
-            device/xiaomi/rothko
+          git clone --depth=1 -b twrp-14.1_a16 https://github.com/JonesqPacMan/android_device_xiaomi_rothko_twrp.git device/xiaomi/rothko
 
-          echo "=== AndroidProducts.mk ==="
-          cat device/xiaomi/rothko/AndroidProducts.mk
-          echo "=== twrp_rothko.mk ==="
-          cat device/xiaomi/rothko/twrp_rothko.mk
-
-      - name: Configure and build vendor_boot
+      - name: Build vendor_boot
         shell: bash
         run: |
           set -o pipefail
           exec > >(tee -a "$GITHUB_WORKSPACE/build.log") 2>&1
-
           cd "$GITHUB_WORKSPACE/twrp"
           export ALLOW_MISSING_DEPENDENCIES=true
           export USE_CCACHE=1
           export CCACHE_EXEC=/usr/bin/ccache
-          ccache -M 8G || true
-
+          ccache -M 2G || true
+          export NINJA_ARGS="-j1"
+          export SOONG_UI_NINJA_ARGS="-j1"
+          echo "=== PRE-BUILD MEMORY ==="
+          free -h
+          swapon --show || true
           source build/envsetup.sh
-
-          echo "=== lunch help ==="
-          lunch --help || true
-
-          echo "=== products containing rothko ==="
-          list_products 2>/dev/null | grep -i rothko || true
-
-          echo "=== available releases for twrp_rothko ==="
-          list_releases twrp_rothko || true
-
-          echo "=== selecting Android 14 TWRP release config: ap2a ==="
           lunch twrp_rothko-ap2a-eng
-
-          echo "=== BUILDING vendorbootimage ==="
-          mka vendorbootimage -j2
+          echo "=== BUILD vendorbootimage (-j1) ==="
+          mka vendorbootimage -j1
 
       - name: Collect artifacts
         if: always()
         run: |
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
           cp "$GITHUB_WORKSPACE/build.log" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
-
+          free -h > "$GITHUB_WORKSPACE/artifacts/memory.txt"
+          swapon --show > "$GITHUB_WORKSPACE/artifacts/swap.txt" || true
+          df -h > "$GITHUB_WORKSPACE/artifacts/disk.txt"
           OUT="$GITHUB_WORKSPACE/twrp/out/target/product/rothko"
           if [ -d "$OUT" ]; then
-            find "$OUT" -maxdepth 3 -type f \
-              \( -name 'vendor_boot.img' -o -name 'recovery.img' -o \
-                 -name '*ramdisk*' -o -name '*.cpio' -o -name '*.lz4' \) \
-              -print -exec cp -L {} "$GITHUB_WORKSPACE/artifacts/" \; || true
-
+            find "$OUT" -maxdepth 3 -type f \( -name 'vendor_boot.img' -o -name 'recovery.img' -o -name '*ramdisk*' -o -name '*.cpio' -o -name '*.lz4' \) -print > "$GITHUB_WORKSPACE/artifacts/output-files.txt" || true
             if [ -f "$OUT/vendor_boot.img" ]; then
-              sha256sum "$OUT/vendor_boot.img" | tee "$GITHUB_WORKSPACE/artifacts/SHA256SUMS.txt"
-              stat "$OUT/vendor_boot.img" | tee "$GITHUB_WORKSPACE/artifacts/vendor_boot-stat.txt"
+              cp "$OUT/vendor_boot.img" "$GITHUB_WORKSPACE/artifacts/"
+              sha256sum "$OUT/vendor_boot.img" > "$GITHUB_WORKSPACE/artifacts/SHA256SUMS.txt"
+              stat "$OUT/vendor_boot.img" > "$GITHUB_WORKSPACE/artifacts/vendor_boot-stat.txt"
             fi
           fi
-
-          df -h > "$GITHUB_WORKSPACE/artifacts/disk-usage.txt"
 
       - name: Upload result and logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rothko-twrp-build-v2
+          name: rothko-twrp-build-v3
           path: artifacts/
           if-no-files-found: warn
           retention-days: 7
