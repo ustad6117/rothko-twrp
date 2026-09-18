@@ -1,4 +1,4 @@
-name: Build Rothko TWRP v13
+name: Build Rothko TWRP v15
 on:
   workflow_dispatch:
 
@@ -22,14 +22,14 @@ jobs:
           free -h
           swapon --show
 
-      - name: Restore TWRP source cache
+      - name: Restore Repo object cache
         id: source-cache
         uses: actions/cache/restore@v4
         with:
-          path: twrp
-          key: rothko-twrp14.1-source-${{ runner.os }}-${{ github.run_id }}
+          path: twrp/.repo
+          key: rothko-twrp14.1-repo-${{ runner.os }}-${{ github.run_id }}
           restore-keys: |
-            rothko-twrp14.1-source-${{ runner.os }}-
+            rothko-twrp14.1-repo-${{ runner.os }}-
 
       - name: Restore compiler cache
         id: ccache-cache
@@ -62,6 +62,42 @@ jobs:
           mkdir -p device/xiaomi
           rm -rf device/xiaomi/rothko
           git clone --depth=1 -b twrp-14.1_a16 https://github.com/JonesqPacMan/android_device_xiaomi_rothko_twrp.git device/xiaomi/rothko
+
+          echo "=== Import verified Android 16 TWRP partition.cpp baseline ==="
+          # Use the recovery-framework partition implementation from an Android 16
+          # TWRP tree that is actively built for API 36 devices.  Import ONLY
+          # partition.cpp: do not import Qualcomm vold/Weaver/KeyMint or any
+          # device-specific files into rothko (MediaTek).
+          rm -rf "$GITHUB_WORKSPACE/a16-twrp-reference"
+          git clone --depth=1 https://github.com/MissMyTime/twrp_device_sm8850.git "$GITHUB_WORKSPACE/a16-twrp-reference"
+          REF="$GITHUB_WORKSPACE/a16-twrp-reference/patches/common/files/bootable/recovery/partition.cpp"
+          test -s "$REF"
+          test -s bootable/recovery/partition.cpp
+          cp -f bootable/recovery/partition.cpp "$GITHUB_WORKSPACE/partition.cpp.upstream"
+          cp -f "$REF" bootable/recovery/partition.cpp
+          echo "reference_partition_sha256=$(sha256sum "$REF" | awk '{print $1}')"
+          echo "installed_partition_sha256=$(sha256sum bootable/recovery/partition.cpp | awk '{print $1}')"
+          cmp -s "$REF" bootable/recovery/partition.cpp
+
+          # v13 failed because upstream partition.cpp referenced legacy FDE APIs
+          # that are absent in the Android-16 recovery source. The reference file
+          # must not contain those stale call sites. Refuse to build rather than
+          # inventing stubs if the reference changes unexpectedly.
+          python3 - <<'PYA16'
+          from pathlib import Path
+          p = Path("bootable/recovery/partition.cpp")
+          data = p.read_text(errors="surrogateescape")
+          stale = [
+              "set_partition_data(",
+              "cryptfs_check_footer(",
+              "cryptfs_get_password_type(",
+              "delete_crypto_blk_dev(",
+          ]
+          found = [x for x in stale if x in data]
+          print("legacy_fde_calls_in_a16_reference=" + (", ".join(found) if found else "<none>"))
+          if found:
+              raise SystemExit("ERROR: Android 16 reference partition.cpp still contains legacy FDE calls; refusing speculative patch")
+          PYA16
 
       - name: Patch exact generated dependency
         shell: bash
@@ -313,6 +349,15 @@ jobs:
           fi
           find "$OUT" -maxdepth 4 -type f \( -name 'vendor_boot.img' -o -name '*ramdisk*' -o -name '*.cpio' -o -name '*.lz4' \) -print > "$GITHUB_WORKSPACE/artifacts/output-files.txt" 2>/dev/null || true
 
+      - name: Free build output before cache save
+        if: always()
+        run: |
+          echo "Disk before out cleanup:"
+          df -h /
+          rm -rf "$GITHUB_WORKSPACE/twrp/out"
+          echo "Disk after out cleanup:"
+          df -h /
+
       - name: Save compiler cache even on failure
         if: always()
         uses: actions/cache/save@v4
@@ -320,18 +365,18 @@ jobs:
           path: ~/.cache/ccache
           key: rothko-twrp14.1-ccache-${{ runner.os }}-${{ github.run_id }}
 
-      - name: Save TWRP source cache even on failure
+      - name: Save Repo object cache even on failure
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: twrp
-          key: rothko-twrp14.1-source-${{ runner.os }}-${{ github.run_id }}
+          path: twrp/.repo
+          key: rothko-twrp14.1-repo-${{ runner.os }}-${{ github.run_id }}
 
       - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rothko-twrp-build-v13
+          name: rothko-twrp-build-v14
           path: artifacts/
           if-no-files-found: warn
           retention-days: 7
