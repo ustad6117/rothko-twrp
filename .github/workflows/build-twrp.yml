@@ -1,4 +1,4 @@
-name: Build Rothko TWRP v9
+name: Build Rothko TWRP v10
 on:
   workflow_dispatch:
 
@@ -204,7 +204,13 @@ jobs:
           NINJA="prebuilts/build-tools/linux-x86/bin/ninja"
           test -x "$NINJA"
 
-          echo "=== Starting patched Ninja graph: $COMBINED ==="
+          echo "=== Verify real tzdata target exists in generated graph ==="
+          if ! "$NINJA" -f "$COMBINED" -t targets all | grep -E -q '(^|/)tzdata($|:)'; then
+            echo "ERROR: generated graph has no real tzdata target; refusing fake tzdata workaround."
+            exit 44
+          fi
+
+          echo "=== Starting patched Ninja graph with tzdata dependency: $COMBINED ==="
           "$NINJA" \
             -d keepdepfile \
             -d keeprsp \
@@ -213,7 +219,7 @@ jobs:
             -o usesphonyoutputs=yes \
             -w dupbuild=err \
             -w missingdepfile=err \
-            vendorbootimage
+            tzdata vendorbootimage
 
       - name: Collect
         if: always()
@@ -243,7 +249,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rothko-twrp-build-v9
+          name: rothko-twrp-build-v10
           path: artifacts/
           if-no-files-found: warn
           retention-days: 7
