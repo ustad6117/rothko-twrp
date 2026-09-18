@@ -1,4 +1,4 @@
-name: Build Rothko TWRP v10
+name: Build Rothko TWRP v11
 on:
   workflow_dispatch:
 
@@ -204,13 +204,51 @@ jobs:
           NINJA="prebuilts/build-tools/linux-x86/bin/ninja"
           test -x "$NINJA"
 
-          echo "=== Verify real tzdata target exists in generated graph ==="
-          if ! "$NINJA" -f "$COMBINED" -t targets all | grep -E -q '(^|/)tzdata($|:)'; then
-            echo "ERROR: generated graph has no real tzdata target; refusing fake tzdata workaround."
-            exit 44
-          fi
+          echo "=== Repair legacy TWRP tzdata copy source ==="
+          TZ_SRC="system/timezone/output_data/iana/tzdata"
+          test -s "$TZ_SRC"
+          echo "tzdata_source=$TZ_SRC size=$(stat -c%s "$TZ_SRC")"
 
-          echo "=== Starting patched Ninja graph with tzdata dependency: $COMBINED ==="
+          python3 - "$BUILD_NINJA" "$TZ_SRC" <<'PYTZ'
+          import sys
+          from pathlib import Path
+
+          p = Path(sys.argv[1])
+          src = sys.argv[2]
+          data = p.read_text(errors="surrogateescape")
+
+          old = "out/target/product/rothko/system/usr/share/zoneinfo/tzdata"
+          lines = data.splitlines(keepends=True)
+          hits = 0
+          out = []
+
+          for line in lines:
+              # Restrict the rewrite to the legacy tzdata_twrp rule/command.
+              if "tzdata_twrp" in line and old in line:
+                  n = line.count(old)
+                  line = line.replace(old, src)
+                  hits += n
+              out.append(line)
+
+          print(f"tzdata_twrp_source_rewrites={hits}")
+          if hits != 1:
+              raise SystemExit(
+                  f"ERROR: expected exactly one tzdata_twrp source rewrite, got {hits}"
+              )
+
+          patched = "".join(out)
+          p.write_text(patched, errors="surrogateescape")
+
+          # Verify the legacy command no longer asks for the missing installed
+          # system path and now references the canonical AOSP prebuilt.
+          relevant = [x for x in patched.splitlines() if "tzdata_twrp" in x]
+          if not any(src in x for x in relevant):
+              raise SystemExit("ERROR: canonical tzdata source not present in tzdata_twrp rule")
+          if any(old in x for x in relevant):
+              raise SystemExit("ERROR: stale installed tzdata path remains in tzdata_twrp rule")
+          PYTZ
+
+          echo "=== Starting patched Ninja graph: $COMBINED ==="
           "$NINJA" \
             -d keepdepfile \
             -d keeprsp \
@@ -219,7 +257,7 @@ jobs:
             -o usesphonyoutputs=yes \
             -w dupbuild=err \
             -w missingdepfile=err \
-            tzdata vendorbootimage
+            vendorbootimage
 
       - name: Collect
         if: always()
@@ -249,7 +287,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rothko-twrp-build-v10
+          name: rothko-twrp-build-v11
           path: artifacts/
           if-no-files-found: warn
           retention-days: 7
