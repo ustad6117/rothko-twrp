@@ -1,4 +1,4 @@
-name: Build Rothko TWRP v4
+name: Build Rothko TWRP v5
 
 on:
   workflow_dispatch:
@@ -65,49 +65,94 @@ jobs:
             https://github.com/JonesqPacMan/android_device_xiaomi_rothko_twrp.git \
             device/xiaomi/rothko
 
-      - name: Patch obsolete AIDL NDK platform module names
+      - name: Compatibility patch for obsolete AIDL NDK module references
         shell: bash
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/twrp"
 
-          echo "=== BEFORE: obsolete -ndk_platform references ==="
-          grep -RIn --include='Android.bp' --include='Android.mk' \
-            --include='*.mk' --include='*.bp' \
-            -- '-ndk_platform' . > "$GITHUB_WORKSPACE/ndk-platform-before.txt" || true
-          cat "$GITHUB_WORKSPACE/ndk-platform-before.txt" || true
-
-          # Android's AIDL NDK backend migrated module names from
-          # *-ndk_platform to *-ndk.  The v3 failure was specifically:
-          # android.security.apc-ndk_platform.so.toc -> no known rule.
+          # IMPORTANT:
+          # v4 was too broad: it also rewrote literal generated-header paths
+          # inside prebuilts/vndk/v31. Those paths physically contain
+          # "-ndk_platform" and MUST NOT be renamed.
           #
-          # Patch build-description files only; never touch source code,
-          # prebuilts, .repo metadata or output files.
-          while IFS= read -r -d '' f; do
-            if grep -q -- '-ndk_platform' "$f"; then
-              sed -i 's/-ndk_platform/-ndk/g' "$f"
-            fi
-          done < <(
-            find . \
-              -path './.repo' -prune -o \
-              -path './out' -prune -o \
-              -type f \( -name 'Android.bp' -o -name 'Android.mk' -o -name '*.mk' -o -name '*.bp' \) \
-              -print0
+          # v5 only rewrites quoted MODULE TOKENS such as:
+          #   "android.security.apc-ndk_platform"
+          # to:
+          #   "android.security.apc-ndk"
+          #
+          # Tokens containing "/" are intentionally ignored, so filesystem
+          # paths such as .../android.hardware.common-V2-ndk_platform-source/...
+          # remain byte-for-byte unchanged.
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          root = Path(".")
+          suffixes = {".bp", ".mk"}
+          token = re.compile(r'"([A-Za-z0-9_.@+-]+)-ndk_platform"')
+          changed = []
+
+          for p in root.rglob("*"):
+              if not p.is_file():
+                  continue
+              parts = p.parts
+              if ".repo" in parts or "out" in parts:
+                  continue
+              # Never modify VNDK prebuilts. Android 12 VNDK snapshots
+              # legitimately retain -ndk_platform filenames/header paths.
+              if len(parts) >= 3 and parts[0] == "prebuilts" and parts[1] == "vndk":
+                  continue
+              if p.name not in ("Android.bp", "Android.mk") and p.suffix not in suffixes:
+                  continue
+
+              try:
+                  old = p.read_text(encoding="utf-8")
+              except UnicodeDecodeError:
+                  continue
+              new, count = token.subn(lambda m: f'"{m.group(1)}-ndk"', old)
+              if count:
+                  p.write_text(new, encoding="utf-8")
+                  changed.append((str(p), count))
+
+          report = Path("../aidl-ndk-module-patch.txt")
+          report.write_text(
+              "\n".join(f"{count}\t{path}" for path, count in changed) +
+              ("\n" if changed else "NO MATCHES\n"),
+              encoding="utf-8"
           )
+          print(report.read_text())
+          PY
 
-          echo "=== AFTER: remaining obsolete references ==="
-          grep -RIn --exclude-dir=.repo --exclude-dir=out \
-            --include='Android.bp' --include='Android.mk' \
-            --include='*.mk' --include='*.bp' \
-            -- '-ndk_platform' . > "$GITHUB_WORKSPACE/ndk-platform-after.txt" || true
-          cat "$GITHUB_WORKSPACE/ndk-platform-after.txt" || true
+          echo "=== Verify VNDK v31 paths were NOT modified ==="
+          grep -n \
+            'android.hardware.common-V2-ndk_platform-source/gen/include' \
+            prebuilts/vndk/v31/arm64/Android.bp | head -5 \
+            | tee "$GITHUB_WORKSPACE/vndk-v31-common-check.txt"
 
-          echo "=== APC module definitions/references after patch ==="
-          grep -RIn --exclude-dir=.repo --exclude-dir=out \
+          grep -n \
+            'android.hardware.graphics.common-V2-ndk_platform-source/gen/include' \
+            prebuilts/vndk/v31/arm64/Android.bp | head -5 \
+            | tee "$GITHUB_WORKSPACE/vndk-v31-graphics-check.txt"
+
+          test -s "$GITHUB_WORKSPACE/vndk-v31-common-check.txt"
+          test -s "$GITHUB_WORKSPACE/vndk-v31-graphics-check.txt"
+
+          echo "=== Remaining quoted obsolete module tokens outside VNDK ==="
+          grep -RIn \
+            --exclude-dir=.repo --exclude-dir=out \
+            --exclude-dir=vndk \
             --include='Android.bp' --include='Android.mk' \
-            -- 'android.security.apc-ndk' . \
-            > "$GITHUB_WORKSPACE/apc-after.txt" || true
-          cat "$GITHUB_WORKSPACE/apc-after.txt" || true
+            -E '"[A-Za-z0-9_.@+-]+-ndk_platform"' . \
+            | tee "$GITHUB_WORKSPACE/remaining-ndk-platform-modules.txt" || true
+
+          echo "=== APC references after targeted patch ==="
+          grep -RIn \
+            --exclude-dir=.repo --exclude-dir=out \
+            --include='Android.bp' --include='Android.mk' \
+            'android.security.apc-ndk' . \
+            | tee "$GITHUB_WORKSPACE/apc-references.txt" || true
 
       - name: Build vendor_boot
         shell: bash
@@ -120,6 +165,8 @@ jobs:
           export USE_CCACHE=1
           export CCACHE_EXEC=/usr/bin/ccache
           ccache -M 2G || true
+
+          # v3/v4 proved the 15.6 GiB runner is stable with swap + one job.
           export NINJA_ARGS="-j1"
           export SOONG_UI_NINJA_ARGS="-j1"
 
@@ -129,6 +176,7 @@ jobs:
 
           source build/envsetup.sh
           lunch twrp_rothko-ap2a-eng
+
           echo "=== BUILD vendorbootimage (-j1) ==="
           mka vendorbootimage -j1
 
@@ -136,11 +184,12 @@ jobs:
         if: always()
         run: |
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
-
           cp "$GITHUB_WORKSPACE/build.log" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
-          cp "$GITHUB_WORKSPACE/ndk-platform-before.txt" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
-          cp "$GITHUB_WORKSPACE/ndk-platform-after.txt" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
-          cp "$GITHUB_WORKSPACE/apc-after.txt" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
+          cp "$GITHUB_WORKSPACE/aidl-ndk-module-patch.txt" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
+          cp "$GITHUB_WORKSPACE/vndk-v31-common-check.txt" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
+          cp "$GITHUB_WORKSPACE/vndk-v31-graphics-check.txt" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
+          cp "$GITHUB_WORKSPACE/remaining-ndk-platform-modules.txt" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
+          cp "$GITHUB_WORKSPACE/apc-references.txt" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
 
           free -h > "$GITHUB_WORKSPACE/artifacts/memory.txt"
           swapon --show > "$GITHUB_WORKSPACE/artifacts/swap.txt" || true
@@ -159,6 +208,17 @@ jobs:
                 > "$GITHUB_WORKSPACE/artifacts/SHA256SUMS.txt"
               stat "$OUT/vendor_boot.img" \
                 > "$GITHUB_WORKSPACE/artifacts/vendor_boot-stat.txt"
+
+              SIZE=$(stat -c%s "$OUT/vendor_boot.img")
+              {
+                echo "vendor_boot_size=$SIZE"
+                echo "rothko_partition_limit=67108864"
+                if [ "$SIZE" -le 67108864 ]; then
+                  echo "size_check=PASS"
+                else
+                  echo "size_check=FAIL"
+                fi
+              } > "$GITHUB_WORKSPACE/artifacts/vendor_boot-size-check.txt"
             fi
           fi
 
@@ -166,7 +226,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rothko-twrp-build-v4
+          name: rothko-twrp-build-v5
           path: artifacts/
           if-no-files-found: warn
           retention-days: 7
