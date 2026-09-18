@@ -1,4 +1,4 @@
-name: Build Rothko TWRP v8
+name: Build Rothko TWRP v9
 on:
   workflow_dispatch:
 
@@ -79,7 +79,7 @@ jobs:
           grep -q 'android.hardware.common-V2-ndk_platform-source/gen/include' prebuilts/vndk/v31/arm64/Android.bp
           grep -q 'android.hardware.graphics.common-V2-ndk_platform-source/gen/include' prebuilts/vndk/v31/arm64/Android.bp
 
-      - name: Generate graph, patch exact APC edge, and run Ninja
+      - name: Generate graph, repair stale NDK-platform TOC edges, and run Ninja
         shell: bash
         run: |
           set -o pipefail
@@ -94,7 +94,8 @@ jobs:
           source build/envsetup.sh
           lunch twrp_rothko-ap2a-eng
 
-          # Generate Soong/Kati + the top-level combined Ninja graph, but don't execute Ninja.
+          # Generate Soong/Kati graph only. We must patch the generated graph
+          # before Ninja executes it.
           build/soong/soong_ui.bash --make-mode --skip-ninja vendorbootimage
 
           echo "=== Resolve actual combined Ninja file ==="
@@ -105,67 +106,101 @@ jobs:
           COMBINED="out/combined${KATI_SUFFIX}.ninja"
 
           if [ ! -f "$COMBINED" ]; then
-            echo "Expected combined graph not found at: $COMBINED"
-            echo "Top-level Ninja files present:"
+            echo "ERROR: expected combined graph not found: $COMBINED"
             find out -maxdepth 1 -type f -name '*.ninja' -printf '%p\n' | sort
             exit 41
           fi
           echo "combined_ninja=$COMBINED" | tee "$GITHUB_WORKSPACE/ninja-entrypoint.txt"
 
-          echo "=== Patch only known generated Ninja graph files ==="
-          CANDIDATES=(
-            "$COMBINED"
-            "out/build${KATI_SUFFIX}.ninja"
-            "out/build${KATI_SUFFIX}-package.ninja"
-            "out/soong/build.twrp_rothko.ninja"
+          # v8 proved the stale edges are emitted by legacy Make into
+          # out/build${KATI_SUFFIX}.ninja. Repair ONLY stale shared-library
+          # .so.toc dependency paths of this exact form:
+          #
+          # SHARED_LIBRARIES/<module>-ndk_platform_intermediates/
+          # <module>-ndk_platform.so.toc
+          #
+          # This deliberately does NOT replace arbitrary "-ndk_platform"
+          # strings, and therefore cannot rewrite VNDK generated-header
+          # source paths such as "...-ndk_platform-source/...".
+          BUILD_NINJA="out/build${KATI_SUFFIX}.ninja"
+          test -f "$BUILD_NINJA"
+
+          echo "=== Scan exact stale NDK-platform TOC dependency pattern ==="
+          python3 - "$BUILD_NINJA" "$GITHUB_WORKSPACE/generated-ndk-platform-edges.txt" <<'PY'
+          import re, sys
+          from pathlib import Path
+
+          p = Path(sys.argv[1])
+          report = Path(sys.argv[2])
+          data = p.read_text(errors="surrogateescape")
+
+          pat = re.compile(
+              r"SHARED_LIBRARIES/"
+              r"(?P<mod>[A-Za-z0-9_.@+\-]+)-ndk_platform_intermediates/"
+              r"(?P=mod)-ndk_platform\.so\.toc"
           )
 
-          : > "$GITHUB_WORKSPACE/generated-apc-files.txt"
-          BEFORE=0
-          for f in "${CANDIDATES[@]}"; do
-            if [ -f "$f" ]; then
-              echo "checking $f"
-              c=$(grep -F -o 'android.security.apc-ndk_platform' "$f" 2>/dev/null | wc -l || true)
-              if [ "$c" -gt 0 ]; then
-                printf '%s\t%s\n' "$f" "$c" | tee -a "$GITHUB_WORKSPACE/generated-apc-files.txt"
-                BEFORE=$((BEFORE + c))
-              fi
-            fi
-          done
+          matches = list(pat.finditer(data))
+          mods = sorted({m.group("mod") for m in matches})
 
-          echo "stale_apc_count_before=$BEFORE" | tee "$GITHUB_WORKSPACE/generated-patch-counts.txt ninja-entrypoint.txt"
-          if [ "$BEFORE" -eq 0 ]; then
-            echo "ERROR: proven stale APC edge was not found in the expected generated graphs."
-            exit 40
+          report.write_text(
+              "\n".join(f"{m}\t{sum(1 for x in matches if x.group('mod') == m)}"
+                        for m in mods) + ("\n" if mods else "")
+          )
+
+          print(f"stale_ndk_platform_toc_edges_before={len(matches)}")
+          print("modules=" + (", ".join(mods) if mods else "<none>"))
+
+          if not matches:
+              raise SystemExit("ERROR: no stale -ndk_platform .so.toc edges found; refusing broad patch")
+
+          def repl(m):
+              mod = m.group("mod")
+              return (
+                  f"SHARED_LIBRARIES/{mod}-ndk_intermediates/"
+                  f"{mod}-ndk.so.toc"
+              )
+
+          patched, n = pat.subn(repl, data)
+          p.write_text(patched, errors="surrogateescape")
+
+          remaining = list(pat.finditer(patched))
+          print(f"stale_ndk_platform_toc_edges_after={len(remaining)}")
+          if remaining:
+              raise SystemExit("ERROR: stale TOC edges remain after patch")
+
+          # Guard against repeating the v4 mistake.
+          protected = (
+              "android.hardware.common-V2-ndk_platform-source/gen/include",
+              "android.hardware.graphics.common-V2-ndk_platform-source/gen/include",
+          )
+          # These protected paths may or may not occur in this particular Ninja file.
+          # If present, they must remain literally unchanged.
+          for x in protected:
+              before = data.count(x)
+              after = patched.count(x)
+              if before != after:
+                  raise SystemExit(f"ERROR: protected VNDK path changed: {x}")
+              print(f"protected_path_unchanged {x}: {after}")
+          PY
+
+          # Confirm both failures already observed are gone from the generated graph.
+          echo "=== Verify known APC + keystore2 stale edges are gone ==="
+          if grep -F -q \
+            'SHARED_LIBRARIES/android.security.apc-ndk_platform_intermediates/android.security.apc-ndk_platform.so.toc' \
+            "$BUILD_NINJA"; then
+            echo "ERROR: APC stale edge remains"
+            exit 42
+          fi
+          if grep -F -q \
+            'SHARED_LIBRARIES/android.system.keystore2-V1-ndk_platform_intermediates/android.system.keystore2-V1-ndk_platform.so.toc' \
+            "$BUILD_NINJA"; then
+            echo "ERROR: keystore2 stale edge remains"
+            exit 43
           fi
 
-          while IFS=$'\t' read -r f count; do
-            [ -f "$f" ] || continue
-            sed -i 's/android\.security\.apc-ndk_platform/android.security.apc-ndk/g' "$f"
-          done < "$GITHUB_WORKSPACE/generated-apc-files.txt"
-
-          AFTER=0
-          for f in "${CANDIDATES[@]}"; do
-            if [ -f "$f" ]; then
-              c=$(grep -F -o 'android.security.apc-ndk_platform' "$f" 2>/dev/null | wc -l || true)
-              AFTER=$((AFTER + c))
-            fi
-          done
-          echo "stale_apc_count_after=$AFTER" | tee -a "$GITHUB_WORKSPACE/generated-patch-counts.txt ninja-entrypoint.txt"
-          test "$AFTER" -eq 0
-
-          echo "=== Verify replacement APC target is represented ==="
-          REPLACED=0
-          for f in "${CANDIDATES[@]}"; do
-            if [ -f "$f" ] && grep -F -q 'android.security.apc-ndk' "$f"; then
-              echo "replacement present in $f"
-              REPLACED=1
-            fi
-          done
-          test "$REPLACED" -eq 1
-
-          # Run the exact combined graph Soong generated. Do NOT invoke mka/soong_ui
-          # again here, because regeneration would overwrite the surgical graph patch.
+          # Do not run Soong/Make again: it would regenerate BUILD_NINJA and undo
+          # the surgical repair. Execute the exact combined graph already produced.
           NINJA="prebuilts/build-tools/linux-x86/bin/ninja"
           test -x "$NINJA"
 
@@ -184,7 +219,7 @@ jobs:
         if: always()
         run: |
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          for f in build.log source-module-patches.txt generated-apc-files.txt generated-apc-new-files.txt generated-patch-counts.txt ninja-entrypoint.txt; do
+          for f in build.log source-module-patches.txt generated-apc-files.txt generated-apc-new-files.txt generated-patch-counts.txt generated-ndk-platform-edges.txt ninja-entrypoint.txt; do
             cp "$GITHUB_WORKSPACE/$f" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
           done
           free -h > "$GITHUB_WORKSPACE/artifacts/memory.txt"
@@ -208,7 +243,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rothko-twrp-build-v8
+          name: rothko-twrp-build-v9
           path: artifacts/
           if-no-files-found: warn
           retention-days: 7
