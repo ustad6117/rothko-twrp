@@ -1,5 +1,4 @@
-name: Build Rothko TWRP v5
-
+name: Build Rothko TWRP v6
 on:
   workflow_dispatch:
 
@@ -7,15 +6,13 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
-
     steps:
-      - name: Free disk space
+      - name: Free disk
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc || true
           df -h
-          free -h
 
-      - name: Add 12G swap
+      - name: Add swap
         run: |
           sudo swapoff -a || true
           sudo fallocate -l 12G /swapfile
@@ -25,15 +22,10 @@ jobs:
           free -h
           swapon --show
 
-      - name: Install dependencies
+      - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
-            git git-lfs gnupg gperf imagemagick lib32ncurses-dev lib32readline-dev \
-            lib32z1-dev libelf-dev liblz4-tool libncurses-dev libsdl1.2-dev \
-            libssl-dev libxml2 libxml2-utils lz4 lzop pngcrush rsync schedtool \
-            squashfs-tools xsltproc zip zlib1g-dev python3 python-is-python3
+          sudo apt-get install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git git-lfs gnupg gperf imagemagick lib32ncurses-dev lib32readline-dev lib32z1-dev libelf-dev liblz4-tool libncurses-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lz4 lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev python3 python-is-python3
 
       - name: Install repo
         run: |
@@ -42,191 +34,138 @@ jobs:
           chmod +x "$HOME/bin/repo"
           echo "$HOME/bin" >> "$GITHUB_PATH"
 
-      - name: Init TWRP 14.1 source
+      - name: Sync TWRP
         run: |
           mkdir -p "$GITHUB_WORKSPACE/twrp"
           cd "$GITHUB_WORKSPACE/twrp"
-          repo init --depth=1 \
-            -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git \
-            -b twrp-14.1
-
-      - name: Sync source
-        run: |
-          cd "$GITHUB_WORKSPACE/twrp"
+          repo init --depth=1 -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git -b twrp-14.1
           repo sync -c --no-clone-bundle --no-tags --optimized-fetch --prune -j2
-
-      - name: Clone Rothko device tree
-        run: |
-          cd "$GITHUB_WORKSPACE/twrp"
           mkdir -p device/xiaomi
           rm -rf device/xiaomi/rothko
-          git clone --depth=1 \
-            -b twrp-14.1_a16 \
-            https://github.com/JonesqPacMan/android_device_xiaomi_rothko_twrp.git \
-            device/xiaomi/rothko
+          git clone --depth=1 -b twrp-14.1_a16 https://github.com/JonesqPacMan/android_device_xiaomi_rothko_twrp.git device/xiaomi/rothko
 
-      - name: Compatibility patch for obsolete AIDL NDK module references
+      - name: Patch exact generated dependency
         shell: bash
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE/twrp"
 
-          # IMPORTANT:
-          # v4 was too broad: it also rewrote literal generated-header paths
-          # inside prebuilts/vndk/v31. Those paths physically contain
-          # "-ndk_platform" and MUST NOT be renamed.
+          # The source Android.mk/Android.bp patch in v5 was not enough:
+          # the final generated Ninja graph still asks libtar for
+          # android.security.apc-ndk_platform.so.toc.
           #
-          # v5 only rewrites quoted MODULE TOKENS such as:
-          #   "android.security.apc-ndk_platform"
-          # to:
-          #   "android.security.apc-ndk"
-          #
-          # Tokens containing "/" are intentionally ignored, so filesystem
-          # paths such as .../android.hardware.common-V2-ndk_platform-source/...
-          # remain byte-for-byte unchanged.
-
+          # First keep the safe source-level module-token migration.
           python3 - <<'PY'
           from pathlib import Path
           import re
-
-          root = Path(".")
-          suffixes = {".bp", ".mk"}
-          token = re.compile(r'"([A-Za-z0-9_.@+-]+)-ndk_platform"')
-          changed = []
-
-          for p in root.rglob("*"):
-              if not p.is_file():
-                  continue
-              parts = p.parts
-              if ".repo" in parts or "out" in parts:
-                  continue
-              # Never modify VNDK prebuilts. Android 12 VNDK snapshots
-              # legitimately retain -ndk_platform filenames/header paths.
-              if len(parts) >= 3 and parts[0] == "prebuilts" and parts[1] == "vndk":
-                  continue
-              if p.name not in ("Android.bp", "Android.mk") and p.suffix not in suffixes:
-                  continue
-
-              try:
-                  old = p.read_text(encoding="utf-8")
-              except UnicodeDecodeError:
-                  continue
-              new, count = token.subn(lambda m: f'"{m.group(1)}-ndk"', old)
-              if count:
-                  p.write_text(new, encoding="utf-8")
-                  changed.append((str(p), count))
-
-          report = Path("../aidl-ndk-module-patch.txt")
-          report.write_text(
-              "\n".join(f"{count}\t{path}" for path, count in changed) +
-              ("\n" if changed else "NO MATCHES\n"),
-              encoding="utf-8"
-          )
-          print(report.read_text())
+          token=re.compile(r'"([A-Za-z0-9_.@+-]+)-ndk_platform"')
+          changed=[]
+          for p in Path(".").rglob("*"):
+              if not p.is_file(): continue
+              if ".repo" in p.parts or "out" in p.parts: continue
+              if len(p.parts)>=2 and p.parts[0]=="prebuilts" and p.parts[1]=="vndk": continue
+              if p.name not in ("Android.bp","Android.mk") and p.suffix not in (".bp",".mk"): continue
+              try: s=p.read_text()
+              except UnicodeDecodeError: continue
+              n,c=token.subn(lambda m:f'"{m.group(1)}-ndk"',s)
+              if c:
+                  p.write_text(n)
+                  changed.append((str(p),c))
+          Path("../source-module-patches.txt").write_text(
+              "\n".join(f"{c}\t{p}" for p,c in changed)+("\n" if changed else "NO MATCHES\n"))
           PY
 
-          echo "=== Verify VNDK v31 paths were NOT modified ==="
-          grep -n \
-            'android.hardware.common-V2-ndk_platform-source/gen/include' \
-            prebuilts/vndk/v31/arm64/Android.bp | head -5 \
-            | tee "$GITHUB_WORKSPACE/vndk-v31-common-check.txt"
+          # Verify we did not corrupt legitimate v31 filesystem paths.
+          grep -q 'android.hardware.common-V2-ndk_platform-source/gen/include' prebuilts/vndk/v31/arm64/Android.bp
+          grep -q 'android.hardware.graphics.common-V2-ndk_platform-source/gen/include' prebuilts/vndk/v31/arm64/Android.bp
 
-          grep -n \
-            'android.hardware.graphics.common-V2-ndk_platform-source/gen/include' \
-            prebuilts/vndk/v31/arm64/Android.bp | head -5 \
-            | tee "$GITHUB_WORKSPACE/vndk-v31-graphics-check.txt"
-
-          test -s "$GITHUB_WORKSPACE/vndk-v31-common-check.txt"
-          test -s "$GITHUB_WORKSPACE/vndk-v31-graphics-check.txt"
-
-          echo "=== Remaining quoted obsolete module tokens outside VNDK ==="
-          grep -RIn \
-            --exclude-dir=.repo --exclude-dir=out \
-            --exclude-dir=vndk \
-            --include='Android.bp' --include='Android.mk' \
-            -E '"[A-Za-z0-9_.@+-]+-ndk_platform"' . \
-            | tee "$GITHUB_WORKSPACE/remaining-ndk-platform-modules.txt" || true
-
-          echo "=== APC references after targeted patch ==="
-          grep -RIn \
-            --exclude-dir=.repo --exclude-dir=out \
-            --include='Android.bp' --include='Android.mk' \
-            'android.security.apc-ndk' . \
-            | tee "$GITHUB_WORKSPACE/apc-references.txt" || true
-
-      - name: Build vendor_boot
+      - name: Generate build graph and patch libtar edge
         shell: bash
         run: |
           set -o pipefail
           exec > >(tee -a "$GITHUB_WORKSPACE/build.log") 2>&1
-
           cd "$GITHUB_WORKSPACE/twrp"
           export ALLOW_MISSING_DEPENDENCIES=true
           export USE_CCACHE=1
           export CCACHE_EXEC=/usr/bin/ccache
           ccache -M 2G || true
-
-          # v3/v4 proved the 15.6 GiB runner is stable with swap + one job.
           export NINJA_ARGS="-j1"
           export SOONG_UI_NINJA_ARGS="-j1"
-
-          echo "=== PRE-BUILD MEMORY ==="
-          free -h
-          swapon --show || true
 
           source build/envsetup.sh
           lunch twrp_rothko-ap2a-eng
 
-          echo "=== BUILD vendorbootimage (-j1) ==="
-          mka vendorbootimage -j1
+          # Generate Soong/Make Ninja graph without executing build actions.
+          # soong_ui --make-mode is the same front-end used by m/mka.
+          build/soong/soong_ui.bash --make-mode --skip-ninja vendorbootimage
 
-      - name: Collect artifacts
+          echo "=== Locate exact stale APC dependency in generated graph ==="
+          grep -RIl --exclude='*.log' \
+            'android.security.apc-ndk_platform' out \
+            > "$GITHUB_WORKSPACE/generated-apc-files.txt" || true
+          cat "$GITHUB_WORKSPACE/generated-apc-files.txt" || true
+
+          COUNT_BEFORE=$(grep -Roh \
+            'android.security.apc-ndk_platform' out 2>/dev/null | wc -l || true)
+          echo "stale_apc_count_before=$COUNT_BEFORE" | tee "$GITHUB_WORKSPACE/generated-patch-counts.txt"
+
+          if [ "$COUNT_BEFORE" -eq 0 ]; then
+            echo "ERROR: expected stale generated APC dependency was not found; refusing blind patch."
+            exit 40
+          fi
+
+          # Patch ONLY generated textual build metadata, never binaries,
+          # never source, and never prebuilts/vndk. This directly targets
+          # the dependency proven by the v5 final Ninja error.
+          while IFS= read -r -d '' f; do
+            if grep -Iq . "$f" && grep -q 'android.security.apc-ndk_platform' "$f"; then
+              sed -i 's/android\.security\.apc-ndk_platform/android.security.apc-ndk/g' "$f"
+            fi
+          done < <(find out -type f -print0)
+
+          COUNT_AFTER=$(grep -Roh \
+            'android.security.apc-ndk_platform' out 2>/dev/null | wc -l || true)
+          echo "stale_apc_count_after=$COUNT_AFTER" | tee -a "$GITHUB_WORKSPACE/generated-patch-counts.txt"
+          test "$COUNT_AFTER" -eq 0
+
+          echo "=== Verify replacement APC target exists in graph ==="
+          grep -RIl 'android.security.apc-ndk' out | head -50 \
+            | tee "$GITHUB_WORKSPACE/generated-apc-new-files.txt" || true
+
+          # Execute the already generated and surgically corrected graph.
+          NINJA="prebuilts/build-tools/linux-x86/bin/ninja"
+          test -x "$NINJA"
+          "$NINJA" -C out/combined-rothko -j1 vendorbootimage
+
+      - name: Collect
         if: always()
         run: |
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          cp "$GITHUB_WORKSPACE/build.log" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
-          cp "$GITHUB_WORKSPACE/aidl-ndk-module-patch.txt" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
-          cp "$GITHUB_WORKSPACE/vndk-v31-common-check.txt" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
-          cp "$GITHUB_WORKSPACE/vndk-v31-graphics-check.txt" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
-          cp "$GITHUB_WORKSPACE/remaining-ndk-platform-modules.txt" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
-          cp "$GITHUB_WORKSPACE/apc-references.txt" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
-
+          for f in build.log source-module-patches.txt generated-apc-files.txt generated-apc-new-files.txt generated-patch-counts.txt; do
+            cp "$GITHUB_WORKSPACE/$f" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
+          done
           free -h > "$GITHUB_WORKSPACE/artifacts/memory.txt"
           swapon --show > "$GITHUB_WORKSPACE/artifacts/swap.txt" || true
           df -h > "$GITHUB_WORKSPACE/artifacts/disk.txt"
 
           OUT="$GITHUB_WORKSPACE/twrp/out/target/product/rothko"
-          if [ -d "$OUT" ]; then
-            find "$OUT" -maxdepth 4 -type f \
-              \( -name 'vendor_boot.img' -o -name 'recovery.img' -o \
-                 -name '*ramdisk*' -o -name '*.cpio' -o -name '*.lz4' \) \
-              -print > "$GITHUB_WORKSPACE/artifacts/output-files.txt" || true
-
-            if [ -f "$OUT/vendor_boot.img" ]; then
-              cp "$OUT/vendor_boot.img" "$GITHUB_WORKSPACE/artifacts/"
-              sha256sum "$OUT/vendor_boot.img" \
-                > "$GITHUB_WORKSPACE/artifacts/SHA256SUMS.txt"
-              stat "$OUT/vendor_boot.img" \
-                > "$GITHUB_WORKSPACE/artifacts/vendor_boot-stat.txt"
-
-              SIZE=$(stat -c%s "$OUT/vendor_boot.img")
-              {
-                echo "vendor_boot_size=$SIZE"
-                echo "rothko_partition_limit=67108864"
-                if [ "$SIZE" -le 67108864 ]; then
-                  echo "size_check=PASS"
-                else
-                  echo "size_check=FAIL"
-                fi
-              } > "$GITHUB_WORKSPACE/artifacts/vendor_boot-size-check.txt"
-            fi
+          if [ -f "$OUT/vendor_boot.img" ]; then
+            cp "$OUT/vendor_boot.img" "$GITHUB_WORKSPACE/artifacts/"
+            sha256sum "$OUT/vendor_boot.img" > "$GITHUB_WORKSPACE/artifacts/SHA256SUMS.txt"
+            SIZE=$(stat -c%s "$OUT/vendor_boot.img")
+            {
+              echo "vendor_boot_size=$SIZE"
+              echo "partition_limit=67108864"
+              [ "$SIZE" -le 67108864 ] && echo "size_check=PASS" || echo "size_check=FAIL"
+            } > "$GITHUB_WORKSPACE/artifacts/vendor_boot-size-check.txt"
           fi
+          find "$OUT" -maxdepth 4 -type f \( -name 'vendor_boot.img' -o -name '*ramdisk*' -o -name '*.cpio' -o -name '*.lz4' \) -print > "$GITHUB_WORKSPACE/artifacts/output-files.txt" 2>/dev/null || true
 
-      - name: Upload result and logs
+      - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rothko-twrp-build-v5
+          name: rothko-twrp-build-v6
           path: artifacts/
           if-no-files-found: warn
           retention-days: 7
