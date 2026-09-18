@@ -1,4 +1,4 @@
-name: Build Rothko TWRP v7
+name: Build Rothko TWRP v8
 on:
   workflow_dispatch:
 
@@ -79,28 +79,44 @@ jobs:
           grep -q 'android.hardware.common-V2-ndk_platform-source/gen/include' prebuilts/vndk/v31/arm64/Android.bp
           grep -q 'android.hardware.graphics.common-V2-ndk_platform-source/gen/include' prebuilts/vndk/v31/arm64/Android.bp
 
-      - name: Generate graph and patch exact Ninja files
+      - name: Generate graph, patch exact APC edge, and run Ninja
         shell: bash
         run: |
           set -o pipefail
           exec > >(tee -a "$GITHUB_WORKSPACE/build.log") 2>&1
           cd "$GITHUB_WORKSPACE/twrp"
+
           export ALLOW_MISSING_DEPENDENCIES=true
           export USE_CCACHE=1
           export CCACHE_EXEC=/usr/bin/ccache
           ccache -M 2G || true
-          export NINJA_ARGS="-j1"
 
           source build/envsetup.sh
           lunch twrp_rothko-ap2a-eng
 
+          # Generate Soong/Kati + the top-level combined Ninja graph, but don't execute Ninja.
           build/soong/soong_ui.bash --make-mode --skip-ninja vendorbootimage
 
-          echo "=== Inspect only known generated Ninja graphs ==="
+          echo "=== Resolve actual combined Ninja file ==="
+          KATI_SUFFIX=""
+          if [ -f out/last_kati_suffix ]; then
+            KATI_SUFFIX="$(cat out/last_kati_suffix)"
+          fi
+          COMBINED="out/combined${KATI_SUFFIX}.ninja"
+
+          if [ ! -f "$COMBINED" ]; then
+            echo "Expected combined graph not found at: $COMBINED"
+            echo "Top-level Ninja files present:"
+            find out -maxdepth 1 -type f -name '*.ninja' -printf '%p\n' | sort
+            exit 41
+          fi
+          echo "combined_ninja=$COMBINED" | tee "$GITHUB_WORKSPACE/ninja-entrypoint.txt"
+
+          echo "=== Patch only known generated Ninja graph files ==="
           CANDIDATES=(
-            "out/combined-rothko.ninja"
-            "out/build-twrp_rothko.ninja"
-            "out/build-twrp_rothko-package.ninja"
+            "$COMBINED"
+            "out/build${KATI_SUFFIX}.ninja"
+            "out/build${KATI_SUFFIX}-package.ninja"
             "out/soong/build.twrp_rothko.ninja"
           )
 
@@ -109,21 +125,21 @@ jobs:
           for f in "${CANDIDATES[@]}"; do
             if [ -f "$f" ]; then
               echo "checking $f"
-              c=$(grep -o 'android\.security\.apc-ndk_platform' "$f" 2>/dev/null | wc -l || true)
+              c=$(grep -F -o 'android.security.apc-ndk_platform' "$f" 2>/dev/null | wc -l || true)
               if [ "$c" -gt 0 ]; then
-                echo "$f : $c" | tee -a "$GITHUB_WORKSPACE/generated-apc-files.txt"
+                printf '%s\t%s\n' "$f" "$c" | tee -a "$GITHUB_WORKSPACE/generated-apc-files.txt"
                 BEFORE=$((BEFORE + c))
               fi
             fi
           done
-          echo "stale_apc_count_before=$BEFORE" | tee "$GITHUB_WORKSPACE/generated-patch-counts.txt"
+
+          echo "stale_apc_count_before=$BEFORE" | tee "$GITHUB_WORKSPACE/generated-patch-counts.txt ninja-entrypoint.txt"
           if [ "$BEFORE" -eq 0 ]; then
-            echo "ERROR: stale APC edge not found in known Ninja graphs; refusing recursive scan."
+            echo "ERROR: proven stale APC edge was not found in the expected generated graphs."
             exit 40
           fi
 
-          while IFS= read -r line; do
-            f="${line%% : *}"
+          while IFS=$'\t' read -r f count; do
             [ -f "$f" ] || continue
             sed -i 's/android\.security\.apc-ndk_platform/android.security.apc-ndk/g' "$f"
           done < "$GITHUB_WORKSPACE/generated-apc-files.txt"
@@ -131,23 +147,44 @@ jobs:
           AFTER=0
           for f in "${CANDIDATES[@]}"; do
             if [ -f "$f" ]; then
-              c=$(grep -o 'android\.security\.apc-ndk_platform' "$f" 2>/dev/null | wc -l || true)
+              c=$(grep -F -o 'android.security.apc-ndk_platform' "$f" 2>/dev/null | wc -l || true)
               AFTER=$((AFTER + c))
             fi
           done
-          echo "stale_apc_count_after=$AFTER" | tee -a "$GITHUB_WORKSPACE/generated-patch-counts.txt"
+          echo "stale_apc_count_after=$AFTER" | tee -a "$GITHUB_WORKSPACE/generated-patch-counts.txt ninja-entrypoint.txt"
           test "$AFTER" -eq 0
 
-          test -f out/combined-rothko.ninja
-          test -x prebuilts/build-tools/linux-x86/bin/ninja
-          echo "=== Starting patched Ninja graph ==="
-          prebuilts/build-tools/linux-x86/bin/ninja -f out/combined-rothko.ninja -j1 vendorbootimage
+          echo "=== Verify replacement APC target is represented ==="
+          REPLACED=0
+          for f in "${CANDIDATES[@]}"; do
+            if [ -f "$f" ] && grep -F -q 'android.security.apc-ndk' "$f"; then
+              echo "replacement present in $f"
+              REPLACED=1
+            fi
+          done
+          test "$REPLACED" -eq 1
+
+          # Run the exact combined graph Soong generated. Do NOT invoke mka/soong_ui
+          # again here, because regeneration would overwrite the surgical graph patch.
+          NINJA="prebuilts/build-tools/linux-x86/bin/ninja"
+          test -x "$NINJA"
+
+          echo "=== Starting patched Ninja graph: $COMBINED ==="
+          "$NINJA" \
+            -d keepdepfile \
+            -d keeprsp \
+            -j1 \
+            -f "$COMBINED" \
+            -o usesphonyoutputs=yes \
+            -w dupbuild=err \
+            -w missingdepfile=err \
+            vendorbootimage
 
       - name: Collect
         if: always()
         run: |
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          for f in build.log source-module-patches.txt generated-apc-files.txt generated-apc-new-files.txt generated-patch-counts.txt; do
+          for f in build.log source-module-patches.txt generated-apc-files.txt generated-apc-new-files.txt generated-patch-counts.txt ninja-entrypoint.txt; do
             cp "$GITHUB_WORKSPACE/$f" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
           done
           free -h > "$GITHUB_WORKSPACE/artifacts/memory.txt"
@@ -171,7 +208,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rothko-twrp-build-v7
+          name: rothko-twrp-build-v8
           path: artifacts/
           if-no-files-found: warn
           retention-days: 7
