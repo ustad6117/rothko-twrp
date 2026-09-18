@@ -1,4 +1,4 @@
-name: Build Rothko TWRP v6
+name: Build Rothko TWRP v7
 on:
   workflow_dispatch:
 
@@ -79,7 +79,7 @@ jobs:
           grep -q 'android.hardware.common-V2-ndk_platform-source/gen/include' prebuilts/vndk/v31/arm64/Android.bp
           grep -q 'android.hardware.graphics.common-V2-ndk_platform-source/gen/include' prebuilts/vndk/v31/arm64/Android.bp
 
-      - name: Generate build graph and patch libtar edge
+      - name: Generate graph and patch exact Ninja files
         shell: bash
         run: |
           set -o pipefail
@@ -90,52 +90,58 @@ jobs:
           export CCACHE_EXEC=/usr/bin/ccache
           ccache -M 2G || true
           export NINJA_ARGS="-j1"
-          export SOONG_UI_NINJA_ARGS="-j1"
 
           source build/envsetup.sh
           lunch twrp_rothko-ap2a-eng
 
-          # Generate Soong/Make Ninja graph without executing build actions.
-          # soong_ui --make-mode is the same front-end used by m/mka.
           build/soong/soong_ui.bash --make-mode --skip-ninja vendorbootimage
 
-          echo "=== Locate exact stale APC dependency in generated graph ==="
-          grep -RIl --exclude='*.log' \
-            'android.security.apc-ndk_platform' out \
-            > "$GITHUB_WORKSPACE/generated-apc-files.txt" || true
-          cat "$GITHUB_WORKSPACE/generated-apc-files.txt" || true
+          echo "=== Inspect only known generated Ninja graphs ==="
+          CANDIDATES=(
+            "out/combined-rothko.ninja"
+            "out/build-twrp_rothko.ninja"
+            "out/build-twrp_rothko-package.ninja"
+            "out/soong/build.twrp_rothko.ninja"
+          )
 
-          COUNT_BEFORE=$(grep -Roh \
-            'android.security.apc-ndk_platform' out 2>/dev/null | wc -l || true)
-          echo "stale_apc_count_before=$COUNT_BEFORE" | tee "$GITHUB_WORKSPACE/generated-patch-counts.txt"
-
-          if [ "$COUNT_BEFORE" -eq 0 ]; then
-            echo "ERROR: expected stale generated APC dependency was not found; refusing blind patch."
+          : > "$GITHUB_WORKSPACE/generated-apc-files.txt"
+          BEFORE=0
+          for f in "${CANDIDATES[@]}"; do
+            if [ -f "$f" ]; then
+              echo "checking $f"
+              c=$(grep -o 'android\.security\.apc-ndk_platform' "$f" 2>/dev/null | wc -l || true)
+              if [ "$c" -gt 0 ]; then
+                echo "$f : $c" | tee -a "$GITHUB_WORKSPACE/generated-apc-files.txt"
+                BEFORE=$((BEFORE + c))
+              fi
+            fi
+          done
+          echo "stale_apc_count_before=$BEFORE" | tee "$GITHUB_WORKSPACE/generated-patch-counts.txt"
+          if [ "$BEFORE" -eq 0 ]; then
+            echo "ERROR: stale APC edge not found in known Ninja graphs; refusing recursive scan."
             exit 40
           fi
 
-          # Patch ONLY generated textual build metadata, never binaries,
-          # never source, and never prebuilts/vndk. This directly targets
-          # the dependency proven by the v5 final Ninja error.
-          while IFS= read -r -d '' f; do
-            if grep -Iq . "$f" && grep -q 'android.security.apc-ndk_platform' "$f"; then
-              sed -i 's/android\.security\.apc-ndk_platform/android.security.apc-ndk/g' "$f"
+          while IFS= read -r line; do
+            f="${line%% : *}"
+            [ -f "$f" ] || continue
+            sed -i 's/android\.security\.apc-ndk_platform/android.security.apc-ndk/g' "$f"
+          done < "$GITHUB_WORKSPACE/generated-apc-files.txt"
+
+          AFTER=0
+          for f in "${CANDIDATES[@]}"; do
+            if [ -f "$f" ]; then
+              c=$(grep -o 'android\.security\.apc-ndk_platform' "$f" 2>/dev/null | wc -l || true)
+              AFTER=$((AFTER + c))
             fi
-          done < <(find out -type f -print0)
+          done
+          echo "stale_apc_count_after=$AFTER" | tee -a "$GITHUB_WORKSPACE/generated-patch-counts.txt"
+          test "$AFTER" -eq 0
 
-          COUNT_AFTER=$(grep -Roh \
-            'android.security.apc-ndk_platform' out 2>/dev/null | wc -l || true)
-          echo "stale_apc_count_after=$COUNT_AFTER" | tee -a "$GITHUB_WORKSPACE/generated-patch-counts.txt"
-          test "$COUNT_AFTER" -eq 0
-
-          echo "=== Verify replacement APC target exists in graph ==="
-          grep -RIl 'android.security.apc-ndk' out | head -50 \
-            | tee "$GITHUB_WORKSPACE/generated-apc-new-files.txt" || true
-
-          # Execute the already generated and surgically corrected graph.
-          NINJA="prebuilts/build-tools/linux-x86/bin/ninja"
-          test -x "$NINJA"
-          "$NINJA" -C out/combined-rothko -j1 vendorbootimage
+          test -f out/combined-rothko.ninja
+          test -x prebuilts/build-tools/linux-x86/bin/ninja
+          echo "=== Starting patched Ninja graph ==="
+          prebuilts/build-tools/linux-x86/bin/ninja -f out/combined-rothko.ninja -j1 vendorbootimage
 
       - name: Collect
         if: always()
@@ -165,7 +171,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rothko-twrp-build-v6
+          name: rothko-twrp-build-v7
           path: artifacts/
           if-no-files-found: warn
           retention-days: 7
