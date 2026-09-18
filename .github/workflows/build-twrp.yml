@@ -1,4 +1,4 @@
-name: Build Rothko TWRP v11
+name: Build Rothko TWRP v12
 on:
   workflow_dispatch:
 
@@ -22,6 +22,24 @@ jobs:
           free -h
           swapon --show
 
+      - name: Restore TWRP source cache
+        id: source-cache
+        uses: actions/cache@v4
+        with:
+          path: twrp
+          key: rothko-twrp14.1-source-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            rothko-twrp14.1-source-${{ runner.os }}-
+
+      - name: Restore compiler cache
+        id: ccache-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: rothko-twrp14.1-ccache-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            rothko-twrp14.1-ccache-${{ runner.os }}-
+
       - name: Dependencies
         run: |
           sudo apt-get update
@@ -38,6 +56,7 @@ jobs:
         run: |
           mkdir -p "$GITHUB_WORKSPACE/twrp"
           cd "$GITHUB_WORKSPACE/twrp"
+          echo "source_cache_hit=${{ steps.source-cache.outputs.cache-hit }}"
           repo init --depth=1 -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git -b twrp-14.1
           repo sync -c --no-clone-bundle --no-tags --optimized-fetch --prune -j2
           mkdir -p device/xiaomi
@@ -89,7 +108,11 @@ jobs:
           export ALLOW_MISSING_DEPENDENCIES=true
           export USE_CCACHE=1
           export CCACHE_EXEC=/usr/bin/ccache
-          ccache -M 2G || true
+          export CCACHE_DIR="$HOME/.cache/ccache"
+          mkdir -p "$CCACHE_DIR"
+          ccache -M 4G || true
+          ccache -z || true
+          echo "ccache_cache_hit=${{ steps.ccache-cache.outputs.cache-hit }}"
 
           source build/envsetup.sh
           lunch twrp_rothko-ap2a-eng
@@ -231,21 +254,20 @@ jobs:
               out.append(line)
 
           print(f"tzdata_twrp_source_rewrites={hits}")
-          if hits != 1:
-              raise SystemExit(
-                  f"ERROR: expected exactly one tzdata_twrp source rewrite, got {hits}"
-              )
+          if hits < 1:
+              raise SystemExit("ERROR: no legacy tzdata source found inside tzdata_twrp rule")
 
           patched = "".join(out)
-          p.write_text(patched, errors="surrogateescape")
-
-          # Verify the legacy command no longer asks for the missing installed
-          # system path and now references the canonical AOSP prebuilt.
           relevant = [x for x in patched.splitlines() if "tzdata_twrp" in x]
-          if not any(src in x for x in relevant):
-              raise SystemExit("ERROR: canonical tzdata source not present in tzdata_twrp rule")
-          if any(old in x for x in relevant):
+          stale = sum(x.count(old) for x in relevant)
+          real = sum(x.count(src) for x in relevant)
+          print(f"tzdata_twrp_stale_after={stale}")
+          print(f"tzdata_twrp_real_source_refs_after={real}")
+          if stale != 0:
               raise SystemExit("ERROR: stale installed tzdata path remains in tzdata_twrp rule")
+          if real < 1:
+              raise SystemExit("ERROR: canonical tzdata source not present in tzdata_twrp rule")
+          p.write_text(patched, errors="surrogateescape")
           PYTZ
 
           echo "=== Starting patched Ninja graph: $COMBINED ==="
@@ -269,6 +291,11 @@ jobs:
           free -h > "$GITHUB_WORKSPACE/artifacts/memory.txt"
           swapon --show > "$GITHUB_WORKSPACE/artifacts/swap.txt" || true
           df -h > "$GITHUB_WORKSPACE/artifacts/disk.txt"
+          {
+            echo "source_cache_hit=${{ steps.source-cache.outputs.cache-hit }}"
+            echo "ccache_cache_hit=${{ steps.ccache-cache.outputs.cache-hit }}"
+          } > "$GITHUB_WORKSPACE/artifacts/cache-restore.txt"
+          CCACHE_DIR="$HOME/.cache/ccache" ccache -s > "$GITHUB_WORKSPACE/artifacts/ccache-stats.txt" 2>&1 || true
 
           OUT="$GITHUB_WORKSPACE/twrp/out/target/product/rothko"
           if [ -f "$OUT/vendor_boot.img" ]; then
@@ -287,7 +314,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rothko-twrp-build-v11
+          name: rothko-twrp-build-v12
           path: artifacts/
           if-no-files-found: warn
           retention-days: 7
