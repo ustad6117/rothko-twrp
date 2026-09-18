@@ -1,4 +1,4 @@
-name: Build Rothko TWRP v15
+name: Build Rothko TWRP v16
 on:
   workflow_dispatch:
 
@@ -79,24 +79,32 @@ jobs:
           echo "installed_partition_sha256=$(sha256sum bootable/recovery/partition.cpp | awk '{print $1}')"
           cmp -s "$REF" bootable/recovery/partition.cpp
 
-          # v13 failed because upstream partition.cpp referenced legacy FDE APIs
-          # that are absent in the Android-16 recovery source. The reference file
-          # must not contain those stale call sites. Refuse to build rather than
-          # inventing stubs if the reference changes unexpectedly.
+          # v13 failed on four *active* legacy-FDE calls.  The maintained A16
+          # reference intentionally keeps those old call sites as // comments.
+          # v15 incorrectly searched raw text and therefore rejected comments.
+          # Strip C/C++ comments first and reject only executable occurrences.
           python3 - <<'PYA16'
           from pathlib import Path
+          import re
           p = Path("bootable/recovery/partition.cpp")
           data = p.read_text(errors="surrogateescape")
+          # Remove block comments, then // comments. This is sufficient for these
+          # identifier call sites and avoids treating the reference's commented
+          # legacy FDE code as executable C++.
+          active = re.sub(r'/\*.*?\*/', '', data, flags=re.S)
+          active = re.sub(r'//.*', '', active)
           stale = [
               "set_partition_data(",
               "cryptfs_check_footer(",
               "cryptfs_get_password_type(",
               "delete_crypto_blk_dev(",
           ]
-          found = [x for x in stale if x in data]
-          print("legacy_fde_calls_in_a16_reference=" + (", ".join(found) if found else "<none>"))
-          if found:
-              raise SystemExit("ERROR: Android 16 reference partition.cpp still contains legacy FDE calls; refusing speculative patch")
+          raw_found = [x for x in stale if x in data]
+          active_found = [x for x in stale if x in active]
+          print("legacy_fde_tokens_raw=" + (", ".join(raw_found) if raw_found else "<none>"))
+          print("legacy_fde_calls_active=" + (", ".join(active_found) if active_found else "<none>"))
+          if active_found:
+              raise SystemExit("ERROR: Android 16 reference has ACTIVE legacy FDE calls")
           PYA16
 
       - name: Patch exact generated dependency
@@ -365,18 +373,11 @@ jobs:
           path: ~/.cache/ccache
           key: rothko-twrp14.1-ccache-${{ runner.os }}-${{ github.run_id }}
 
-      - name: Save Repo object cache even on failure
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: twrp/.repo
-          key: rothko-twrp14.1-repo-${{ runner.os }}-${{ github.run_id }}
-
       - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rothko-twrp-build-v14
+          name: rothko-twrp-build-v16
           path: artifacts/
           if-no-files-found: warn
           retention-days: 7
