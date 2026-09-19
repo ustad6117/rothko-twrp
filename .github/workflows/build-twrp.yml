@@ -1,4 +1,4 @@
-name: Build Rothko TWRP v17 - native TWRP 16
+name: Build Rothko TWRP v18 - native TWRP 16
 on:
   workflow_dispatch:
 
@@ -74,8 +74,8 @@ jobs:
           ccache -M 4G || true
           ccache -z || true
           source build/envsetup.sh
-          echo '=== lunch twrp_rothko ===' | tee "$GITHUB_WORKSPACE/build.log"
-          lunch twrp_rothko 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
+          echo '=== lunch twrp_rothko-bp2a-eng ===' | tee "$GITHUB_WORKSPACE/build.log"
+          lunch twrp_rothko-bp2a-eng 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
           echo '=== m vendorbootimage -j1 ===' | tee -a "$GITHUB_WORKSPACE/build.log"
           m vendorbootimage -j1 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
 
@@ -131,7 +131,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rothko-twrp-build-v17
+          name: rothko-twrp-build-v18
           path: artifacts/
           if-no-files-found: warn
           retention-days: 7
