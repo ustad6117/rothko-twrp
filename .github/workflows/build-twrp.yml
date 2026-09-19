@@ -1,4 +1,4 @@
-name: Build Rothko TWRP v21 - native TWRP 16
+name: Build Rothko TWRP v22 - native TWRP 16
 on:
   workflow_dispatch:
 
@@ -37,7 +37,7 @@ jobs:
 
       - name: Sync native TWRP 16 source and rothko tree
         run: |
-          set -euxo pipefail
+          set -exo pipefail
           mkdir -p "$GITHUB_WORKSPACE/twrp"
           cd "$GITHUB_WORKSPACE/twrp"
           repo init --depth=1 -u https://github.com/TWRP-Test/platform_manifest_twrp_aosp.git -b twrp-16.0
@@ -51,7 +51,7 @@ jobs:
 
       - name: Verify rothko vendor_boot contract
         run: |
-          set -euxo pipefail
+          set -exo pipefail
           cd "$GITHUB_WORKSPACE/twrp"
           grep -q 'TARGET_NO_RECOVERY.*true' device/xiaomi/rothko/BoardConfig.mk
           grep -q 'BOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT.*true' device/xiaomi/rothko/BoardConfig.mk
@@ -69,7 +69,7 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
-          set -euo pipefail
+          set -eo pipefail
           cd "$GITHUB_WORKSPACE/twrp"
           export ALLOW_MISSING_DEPENDENCIES=true USE_CCACHE=1 CCACHE_EXEC=/usr/bin/ccache
           export CCACHE_DIR="$HOME/.cache/ccache" CCACHE_MAXSIZE=4G OUT_DIR=out
@@ -90,7 +90,7 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
-          set -euo pipefail
+          set -eo pipefail
           cd "$GITHUB_WORKSPACE/twrp"
           export ALLOW_MISSING_DEPENDENCIES=true USE_CCACHE=1 CCACHE_EXEC=/usr/bin/ccache
           export CCACHE_DIR="$HOME/.cache/ccache" CCACHE_MAXSIZE=4G OUT_DIR=out
@@ -107,7 +107,7 @@ jobs:
         if: steps.build1.outcome != 'success' && steps.build2.outcome != 'success'
         shell: bash
         run: |
-          set -euo pipefail
+          set -eo pipefail
           cd "$GITHUB_WORKSPACE/twrp"
           export ALLOW_MISSING_DEPENDENCIES=true USE_CCACHE=1 CCACHE_EXEC=/usr/bin/ccache
           export CCACHE_DIR="$HOME/.cache/ccache" CCACHE_MAXSIZE=4G OUT_DIR=out
@@ -122,7 +122,7 @@ jobs:
       - name: Validate output
         if: success()
         run: |
-          set -euxo pipefail
+          set -exo pipefail
           OUT="$GITHUB_WORKSPACE/twrp/out/target/product/rothko/vendor_boot.img"
           test -s "$OUT"
           SIZE=$(stat -c%s "$OUT")
@@ -171,261 +171,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rothko-twrp-build-v21
-          path: artifacts/
-          if-no-files-found: warn
-          retention-days: 7
-
-      - name: Sync native TWRP 16 source and rothko tree
-        run: |
-          set -euxo pipefail
-          mkdir -p "$GITHUB_WORKSPACE/twrp"
-          cd "$GITHUB_WORKSPACE/twrp"
-          repo init --depth=1 -u https://github.com/TWRP-Test/platform_manifest_twrp_aosp.git -b twrp-16.0
-          repo sync -c --no-clone-bundle --no-tags --optimized-fetch --prune -j2
-          mkdir -p device/xiaomi
-          rm -rf device/xiaomi/rothko
-          git clone --depth=1 -b twrp-14.1_a16 https://github.com/JonesqPacMan/android_device_xiaomi_rothko_twrp.git device/xiaomi/rothko
-          repo manifest -r > "$GITHUB_WORKSPACE/manifest.xml"
-          echo "recovery_head=$(git -C bootable/recovery rev-parse HEAD)"
-          echo "rothko_head=$(git -C device/xiaomi/rothko rev-parse HEAD)"
-
-      - name: Verify rothko vendor_boot contract
-        run: |
-          set -euxo pipefail
-          cd "$GITHUB_WORKSPACE/twrp"
-          grep -q 'TARGET_NO_RECOVERY.*true' device/xiaomi/rothko/BoardConfig.mk
-          grep -q 'BOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT.*true' device/xiaomi/rothko/BoardConfig.mk
-          grep -q 'BOARD_VENDOR_BOOTIMAGE_PARTITION_SIZE.*67108864' device/xiaomi/rothko/BoardConfig.mk
-          grep -q 'TW_INCLUDE_CRYPTO.*true' device/xiaomi/rothko/BoardConfig.mk
-          grep -q 'TW_INCLUDE_CRYPTO_FBE.*true' device/xiaomi/rothko/BoardConfig.mk
-          echo 'rothko_vendor_boot_contract=PASS'
-
-      - name: Build native TWRP 16 vendor_boot
-        shell: bash
-        run: |
-          set -o pipefail
-          cd "$GITHUB_WORKSPACE/twrp"
-          export ALLOW_MISSING_DEPENDENCIES=true
-          export USE_CCACHE=1
-          export CCACHE_EXEC=/usr/bin/ccache
-          export CCACHE_DIR="$HOME/.cache/ccache"
-          export CCACHE_MAXSIZE=4G
-          export OUT_DIR=out
-          ccache -M 4G || true
-          ccache -z || true
-          source build/envsetup.sh
-          # IMPORTANT: never pipe `lunch` into tee. A shell function on the left
-          # side of a pipeline runs in a subshell, so TARGET_RELEASE/TARGET_PRODUCT
-          # exports disappear before `m`. Tee the whole shell through process
-          # substitution instead, which keeps lunch in the current shell.
-          exec > >(tee "$GITHUB_WORKSPACE/build.log") 2>&1
-          echo '=== lunch twrp_rothko bp2a eng (current shell) ==='
-          lunch twrp_rothko bp2a eng
-          echo "TARGET_PRODUCT=${TARGET_PRODUCT:-<unset>}"
-          echo "TARGET_RELEASE=${TARGET_RELEASE:-<unset>}"
-          echo "TARGET_BUILD_VARIANT=${TARGET_BUILD_VARIANT:-<unset>}"
-          test "${TARGET_PRODUCT:-}" = twrp_rothko
-          test "${TARGET_RELEASE:-}" = bp2a
-          test "${TARGET_BUILD_VARIANT:-}" = eng
-          echo 'release_environment_check=PASS'
-          # Keep Soong's Go bootstrap conservative on the 2-core hosted runner.
-          export GOMAXPROCS=2
-          export NINJA_ARGS="-j1"
-          export SOONG_UI_NINJA_ARGS="-j1"
-
-          echo '=== m vendorbootimage -j1 ==='
-          # GitHub-hosted runners have twice terminated Soong bootstrap externally
-          # with SIGTERM (exit 143) at ~99%. That is not a compiler failure.
-          # Preserve out/ and retry ONLY that external-termination status; any real
-          # build error exits immediately so source failures are never hidden.
-          attempt=1
-          while :; do
-            set +e
-            m vendorbootimage -j1
-            rc=$?
-            set -e
-            if [ "$rc" -eq 0 ]; then
-              echo "vendorboot_build=PASS attempt=$attempt"
-              break
-            fi
-            if [ "$rc" -ne 143 ] || [ "$attempt" -ge 3 ]; then
-              echo "vendorboot_build=FAIL rc=$rc attempt=$attempt"
-              exit "$rc"
-            fi
-            echo "external_SIGTERM_143_retry=$attempt"
-            free -h || true
-            df -h / || true
-            sleep 10
-            attempt=$((attempt + 1))
-          done
-
-      - name: Validate output
-        if: success()
-        run: |
-          set -euxo pipefail
-          OUT="$GITHUB_WORKSPACE/twrp/out/target/product/rothko/vendor_boot.img"
-          test -s "$OUT"
-          SIZE=$(stat -c%s "$OUT")
-          echo "vendor_boot_size=$SIZE" | tee "$GITHUB_WORKSPACE/vendor_boot-validation.txt"
-          echo "partition_limit=67108864" | tee -a "$GITHUB_WORKSPACE/vendor_boot-validation.txt"
-          if [ "$SIZE" -gt 67108864 ]; then
-            echo 'size_check=FAIL' | tee -a "$GITHUB_WORKSPACE/vendor_boot-validation.txt"
-            exit 1
-          fi
-          echo 'size_check=PASS' | tee -a "$GITHUB_WORKSPACE/vendor_boot-validation.txt"
-          sha256sum "$OUT" | tee "$GITHUB_WORKSPACE/vendor_boot.sha256"
-
-      - name: Collect
-        if: always()
-        run: |
-          mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          for f in build.log manifest.xml vendor_boot-validation.txt vendor_boot.sha256; do
-            cp "$GITHUB_WORKSPACE/$f" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
-          done
-          free -h > "$GITHUB_WORKSPACE/artifacts/memory.txt"
-          swapon --show > "$GITHUB_WORKSPACE/artifacts/swap.txt" || true
-          df -h > "$GITHUB_WORKSPACE/artifacts/disk.txt"
-          CCACHE_DIR="$HOME/.cache/ccache" ccache -s > "$GITHUB_WORKSPACE/artifacts/ccache-stats.txt" 2>&1 || true
-          OUT="$GITHUB_WORKSPACE/twrp/out/target/product/rothko"
-          if [ -s "$OUT/vendor_boot.img" ]; then
-            cp "$OUT/vendor_boot.img" "$GITHUB_WORKSPACE/artifacts/"
-          fi
-          find "$OUT" -maxdepth 5 -type f \( -name 'vendor_boot.img' -o -name '*ramdisk*' -o -name '*.cpio' -o -name '*.lz4' \) -print > "$GITHUB_WORKSPACE/artifacts/output-files.txt" 2>/dev/null || true
-
-      - name: Free build output before cache save
-        if: always()
-        run: |
-          df -h /
-          rm -rf "$GITHUB_WORKSPACE/twrp/out"
-          sudo rm -f /swapfile || true
-          df -h /
-
-      - name: Save TWRP16 compiler cache even on failure
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: ~/.cache/ccache
-          key: rothko-twrp16-ccache-${{ runner.os }}-${{ github.run_id }}
-
-      - name: Upload
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: rothko-twrp-build-v20
-          path: artifacts/
-          if-no-files-found: warn
-          retention-days: 7
-
-      - name: Sync native TWRP 16 source and rothko tree
-        run: |
-          set -euxo pipefail
-          mkdir -p "$GITHUB_WORKSPACE/twrp"
-          cd "$GITHUB_WORKSPACE/twrp"
-          repo init --depth=1 -u https://github.com/TWRP-Test/platform_manifest_twrp_aosp.git -b twrp-16.0
-          repo sync -c --no-clone-bundle --no-tags --optimized-fetch --prune -j2
-          mkdir -p device/xiaomi
-          rm -rf device/xiaomi/rothko
-          git clone --depth=1 -b twrp-14.1_a16 https://github.com/JonesqPacMan/android_device_xiaomi_rothko_twrp.git device/xiaomi/rothko
-          repo manifest -r > "$GITHUB_WORKSPACE/manifest.xml"
-          echo "recovery_head=$(git -C bootable/recovery rev-parse HEAD)"
-          echo "rothko_head=$(git -C device/xiaomi/rothko rev-parse HEAD)"
-
-      - name: Verify rothko vendor_boot contract
-        run: |
-          set -euxo pipefail
-          cd "$GITHUB_WORKSPACE/twrp"
-          grep -q 'TARGET_NO_RECOVERY.*true' device/xiaomi/rothko/BoardConfig.mk
-          grep -q 'BOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT.*true' device/xiaomi/rothko/BoardConfig.mk
-          grep -q 'BOARD_VENDOR_BOOTIMAGE_PARTITION_SIZE.*67108864' device/xiaomi/rothko/BoardConfig.mk
-          grep -q 'TW_INCLUDE_CRYPTO.*true' device/xiaomi/rothko/BoardConfig.mk
-          grep -q 'TW_INCLUDE_CRYPTO_FBE.*true' device/xiaomi/rothko/BoardConfig.mk
-          echo 'rothko_vendor_boot_contract=PASS'
-
-      - name: Build native TWRP 16 vendor_boot
-        shell: bash
-        run: |
-          set -o pipefail
-          cd "$GITHUB_WORKSPACE/twrp"
-          export ALLOW_MISSING_DEPENDENCIES=true
-          export USE_CCACHE=1
-          export CCACHE_EXEC=/usr/bin/ccache
-          export CCACHE_DIR="$HOME/.cache/ccache"
-          export CCACHE_MAXSIZE=4G
-          export OUT_DIR=out
-          ccache -M 4G || true
-          ccache -z || true
-          source build/envsetup.sh
-          # IMPORTANT: never pipe `lunch` into tee. A shell function on the left
-          # side of a pipeline runs in a subshell, so TARGET_RELEASE/TARGET_PRODUCT
-          # exports disappear before `m`. Tee the whole shell through process
-          # substitution instead, which keeps lunch in the current shell.
-          exec > >(tee "$GITHUB_WORKSPACE/build.log") 2>&1
-          echo '=== lunch twrp_rothko bp2a eng (current shell) ==='
-          lunch twrp_rothko bp2a eng
-          echo "TARGET_PRODUCT=${TARGET_PRODUCT:-<unset>}"
-          echo "TARGET_RELEASE=${TARGET_RELEASE:-<unset>}"
-          echo "TARGET_BUILD_VARIANT=${TARGET_BUILD_VARIANT:-<unset>}"
-          test "${TARGET_PRODUCT:-}" = twrp_rothko
-          test "${TARGET_RELEASE:-}" = bp2a
-          test "${TARGET_BUILD_VARIANT:-}" = eng
-          echo 'release_environment_check=PASS'
-          echo '=== m vendorbootimage -j1 ==='
-          m vendorbootimage -j1
-
-      - name: Validate output
-        if: success()
-        run: |
-          set -euxo pipefail
-          OUT="$GITHUB_WORKSPACE/twrp/out/target/product/rothko/vendor_boot.img"
-          test -s "$OUT"
-          SIZE=$(stat -c%s "$OUT")
-          echo "vendor_boot_size=$SIZE" | tee "$GITHUB_WORKSPACE/vendor_boot-validation.txt"
-          echo "partition_limit=67108864" | tee -a "$GITHUB_WORKSPACE/vendor_boot-validation.txt"
-          if [ "$SIZE" -gt 67108864 ]; then
-            echo 'size_check=FAIL' | tee -a "$GITHUB_WORKSPACE/vendor_boot-validation.txt"
-            exit 1
-          fi
-          echo 'size_check=PASS' | tee -a "$GITHUB_WORKSPACE/vendor_boot-validation.txt"
-          sha256sum "$OUT" | tee "$GITHUB_WORKSPACE/vendor_boot.sha256"
-
-      - name: Collect
-        if: always()
-        run: |
-          mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          for f in build.log manifest.xml vendor_boot-validation.txt vendor_boot.sha256; do
-            cp "$GITHUB_WORKSPACE/$f" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
-          done
-          free -h > "$GITHUB_WORKSPACE/artifacts/memory.txt"
-          swapon --show > "$GITHUB_WORKSPACE/artifacts/swap.txt" || true
-          df -h > "$GITHUB_WORKSPACE/artifacts/disk.txt"
-          CCACHE_DIR="$HOME/.cache/ccache" ccache -s > "$GITHUB_WORKSPACE/artifacts/ccache-stats.txt" 2>&1 || true
-          OUT="$GITHUB_WORKSPACE/twrp/out/target/product/rothko"
-          if [ -s "$OUT/vendor_boot.img" ]; then
-            cp "$OUT/vendor_boot.img" "$GITHUB_WORKSPACE/artifacts/"
-          fi
-          find "$OUT" -maxdepth 5 -type f \( -name 'vendor_boot.img' -o -name '*ramdisk*' -o -name '*.cpio' -o -name '*.lz4' \) -print > "$GITHUB_WORKSPACE/artifacts/output-files.txt" 2>/dev/null || true
-
-      - name: Free build output before cache save
-        if: always()
-        run: |
-          df -h /
-          rm -rf "$GITHUB_WORKSPACE/twrp/out"
-          sudo rm -f /swapfile || true
-          df -h /
-
-      - name: Save TWRP16 compiler cache even on failure
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: ~/.cache/ccache
-          key: rothko-twrp16-ccache-${{ runner.os }}-${{ github.run_id }}
-
-      - name: Upload
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: rothko-twrp-build-v19
+          name: rothko-twrp-build-v22
           path: artifacts/
           if-no-files-found: warn
           retention-days: 7
