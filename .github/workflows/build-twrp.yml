@@ -1,4 +1,4 @@
-name: Build Rothko TWRP v24 - native TWRP 16
+name: Build Rothko TWRP v25 - split recovery fragment
 on:
   workflow_dispatch:
 
@@ -61,33 +61,14 @@ jobs:
           repo manifest -r > "$GITHUB_WORKSPACE/manifest.xml"
           echo "recovery_head=$(git -C bootable/recovery rev-parse HEAD)"
           echo "rothko_head=$(git -C device/xiaomi/rothko rev-parse HEAD)"
-
-      - name: Slim recovery ramdisk for 64 MiB vendor_boot
-        run: |
-          set -euxo pipefail
-          cd "$GITHUB_WORKSPACE/twrp"
-          BC=device/xiaomi/rothko/BoardConfig.mk
-
-          # v23 produced 67,121,152 bytes, only 12 KiB above rothko's real
-          # 64 MiB vendor_boot partition. Do NOT fake a larger partition.
-          #
-          # ntfs-3g is an optional userspace NTFS implementation and is large
-          # enough to give us useful headroom. Keep TWRP's FUSE NTFS/exFAT
-          # settings untouched; only omit the duplicate ntfs-3g implementation.
-          if grep -qE '^TW_INCLUDE_NTFS_3G[[:space:]]*:=[[:space:]]*true' "$BC"; then
-            sed -i -E 's/^TW_INCLUDE_NTFS_3G[[:space:]]*:=[[:space:]]*true/TW_INCLUDE_NTFS_3G := false/' "$BC"
+          # Header v4: build recovery resources as their own RECOVERY-type vendor ramdisk.
+          # This is required so we can transplant only TWRP into the known-good stock vendor_boot.
+          if grep -q '^BOARD_INCLUDE_RECOVERY_RAMDISK_IN_VENDOR_BOOT[[:space:]]*:=' device/xiaomi/rothko/BoardConfig.mk; then
+            sed -i 's/^BOARD_INCLUDE_RECOVERY_RAMDISK_IN_VENDOR_BOOT[[:space:]]*:=.*/BOARD_INCLUDE_RECOVERY_RAMDISK_IN_VENDOR_BOOT := true/' device/xiaomi/rothko/BoardConfig.mk
           else
-            echo 'ERROR: expected TW_INCLUDE_NTFS_3G := true not found; refusing an unverified patch.'
-            exit 1
+            printf '\nBOARD_INCLUDE_RECOVERY_RAMDISK_IN_VENDOR_BOOT := true\n' >> device/xiaomi/rothko/BoardConfig.mk
           fi
-
-          # Preserve the actual hardware partition contract.
-          grep -qE '^BOARD_VENDOR_BOOTIMAGE_PARTITION_SIZE[[:space:]]*:=[[:space:]]*67108864' "$BC"
-          grep -qE '^TW_INCLUDE_NTFS_3G[[:space:]]*:=[[:space:]]*false' "$BC"
-
-          echo '=== v24 ramdisk slimming patch ==='
-          grep -nE 'BOARD_VENDOR_BOOTIMAGE_PARTITION_SIZE|TW_INCLUDE_NTFS_3G|TW_INCLUDE_FUSE_NTFS|TW_INCLUDE_FUSE_EXFAT' "$BC"
-          git -C device/xiaomi/rothko diff -- BoardConfig.mk | tee "$GITHUB_WORKSPACE/v24-device-tree.patch"
+          grep -n 'BOARD_INCLUDE_RECOVERY_RAMDISK_IN_VENDOR_BOOT' device/xiaomi/rothko/BoardConfig.mk
 
       - name: Verify rothko vendor_boot contract
         run: |
@@ -95,6 +76,7 @@ jobs:
           cd "$GITHUB_WORKSPACE/twrp"
           grep -q 'TARGET_NO_RECOVERY.*true' device/xiaomi/rothko/BoardConfig.mk
           grep -q 'BOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT.*true' device/xiaomi/rothko/BoardConfig.mk
+          grep -q 'BOARD_INCLUDE_RECOVERY_RAMDISK_IN_VENDOR_BOOT.*true' device/xiaomi/rothko/BoardConfig.mk
           grep -q 'BOARD_VENDOR_BOOTIMAGE_PARTITION_SIZE.*67108864' device/xiaomi/rothko/BoardConfig.mk
           grep -q 'TW_INCLUDE_CRYPTO.*true' device/xiaomi/rothko/BoardConfig.mk
           grep -q 'TW_INCLUDE_CRYPTO_FBE.*true' device/xiaomi/rothko/BoardConfig.mk
@@ -151,7 +133,7 @@ jobs:
         if: always()
         run: |
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          for f in build.log manifest.xml vendor_boot-validation.txt vendor_boot.sha256 v24-device-tree.patch; do
+          for f in build.log manifest.xml vendor_boot-validation.txt vendor_boot.sha256; do
             cp "$GITHUB_WORKSPACE/$f" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
           done
           free -h > "$GITHUB_WORKSPACE/artifacts/memory.txt"
@@ -162,7 +144,8 @@ jobs:
           if [ -s "$OUT/vendor_boot.img" ]; then
             cp "$OUT/vendor_boot.img" "$GITHUB_WORKSPACE/artifacts/"
           fi
-          find "$OUT" -maxdepth 5 -type f \( -name 'vendor_boot.img' -o -name '*ramdisk*' -o -name '*.cpio' -o -name '*.lz4' \) -print > "$GITHUB_WORKSPACE/artifacts/output-files.txt" 2>/dev/null || true
+          find "$OUT" -maxdepth 8 -type f \( -name 'vendor_boot.img' -o -name '*ramdisk*' -o -name '*.cpio' -o -name '*.lz4' \) -print > "$GITHUB_WORKSPACE/artifacts/output-files.txt" 2>/dev/null || true
+          find "$OUT" -maxdepth 8 -type f \( -name '*recovery*.cpio*' -o -name '*vendor_ramdisk_recovery*' \) -exec cp -v {} "$GITHUB_WORKSPACE/artifacts/" \; 2>/dev/null || true
 
       - name: Free build output before cache save
         if: always()
@@ -183,7 +166,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rothko-twrp-build-v24
+          name: rothko-twrp-build-v25
           path: artifacts/
           if-no-files-found: warn
           retention-days: 7
