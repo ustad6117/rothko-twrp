@@ -1,4 +1,4 @@
-name: Build Rothko TWRP v26 - stock-platform-compatible slim recovery
+name: Build Rothko TWRP v28 FINAL - split stock 3.0.301 hybrid
 on:
   workflow_dispatch:
 
@@ -69,26 +69,10 @@ jobs:
             printf '\nBOARD_INCLUDE_RECOVERY_RAMDISK_IN_VENDOR_BOOT := true\n' >> device/xiaomi/rothko/BoardConfig.mk
           fi
           grep -n 'BOARD_INCLUDE_RECOVERY_RAMDISK_IN_VENDOR_BOOT' device/xiaomi/rothko/BoardConfig.mk
-
-          # Stock vendor_boot already supplies the vendor/platform kernel modules in recovery mode.
-          # Do NOT duplicate the entire vendor_boot module set inside the TWRP RECOVERY fragment.
-          # AOSP explicitly allows recovery ramdisk to contain only additional modules when vendor_boot
-          # is also loaded in recovery mode. Keep only rothko's explicitly requested haptic module.
-          sed -i 's/^TW_LOAD_VENDOR_BOOT_MODULES[[:space:]]*:=.*/TW_LOAD_VENDOR_BOOT_MODULES := false/' device/xiaomi/rothko/BoardConfig.mk
-
-          # Size cuts that do not affect FBE/decryption, ADB, MTP, fastbootd, flashing or OTG.
+          # Final size cut with no functional recovery feature removed: English UI only.
           sed -i 's/^TW_EXTRA_LANGUAGES[[:space:]]*:=.*/TW_EXTRA_LANGUAGES := false/' device/xiaomi/rothko/BoardConfig.mk
-          sed -i 's/^TW_INCLUDE_NTFS_3G[[:space:]]*:=.*/TW_INCLUDE_NTFS_3G := false/' device/xiaomi/rothko/BoardConfig.mk
-          sed -i 's/^TW_INCLUDE_FUSE_NTFS[[:space:]]*:=.*/TW_INCLUDE_FUSE_NTFS := false/' device/xiaomi/rothko/BoardConfig.mk
-          # Prefer toolbox/toybox applets instead of carrying duplicate utility payload where supported.
-          if grep -q '^TW_USE_TOOLBOX[[:space:]]*:=' device/xiaomi/rothko/BoardConfig.mk; then
-            sed -i 's/^TW_USE_TOOLBOX[[:space:]]*:=.*/TW_USE_TOOLBOX := true/' device/xiaomi/rothko/BoardConfig.mk
-          else
-            printf '
-TW_USE_TOOLBOX := true
-' >> device/xiaomi/rothko/BoardConfig.mk
-          fi
-          grep -nE 'TW_LOAD_VENDOR_BOOT_MODULES|TW_EXTRA_LANGUAGES|TW_INCLUDE_NTFS_3G|TW_INCLUDE_FUSE_NTFS|TW_USE_TOOLBOX' device/xiaomi/rothko/BoardConfig.mk
+          sed -i 's/^TW_DEFAULT_LANGUAGE[[:space:]]*:=.*/TW_DEFAULT_LANGUAGE := en/' device/xiaomi/rothko/BoardConfig.mk
+          grep -nE 'TW_EXTRA_LANGUAGES|TW_DEFAULT_LANGUAGE|TW_INCLUDE_CRYPTO|TW_INCLUDE_CRYPTO_FBE|TW_INCLUDE_FASTBOOTD|TW_LOAD_VENDOR_BOOT_MODULES' device/xiaomi/rothko/BoardConfig.mk
 
       - name: Verify rothko vendor_boot contract
         run: |
@@ -129,31 +113,152 @@ TW_USE_TOOLBOX := true
            done) &
           MON_PID=$!
           trap 'kill $MON_PID 2>/dev/null || true' EXIT
-          m out/target/product/rothko/obj/PACKAGING/vendor_ramdisk_fragments_intermediates/recovery.cpio.lz4 -j1
-          echo "recovery_fragment_build=PASS"
-          # Also try the complete image for diagnostics; stock-platform transplant remains the final target.
-          m vendorbootimage -j1 || echo "vendorboot_container_build=NONFATAL"
+          set +e
+          m vendorbootimage -j1
+          BUILD_RC=$?
+          set -e
+          FRAG="$GITHUB_WORKSPACE/twrp/out/target/product/rothko/obj/PACKAGING/vendor_ramdisk_fragments_intermediates/recovery.cpio.lz4"
+          test -s "$FRAG"
+          echo "container_build_rc=$BUILD_RC (nonfatal; recovery fragment exists)"
           kill $MON_PID 2>/dev/null || true
           trap - EXIT
 
-      - name: Validate recovery fragment size
-        if: always()
+      - name: Validate builder container (superseded by final hybrid validator)
+        if: false
         run: |
-          set -eo pipefail
-          FRAG="$GITHUB_WORKSPACE/twrp/out/target/product/rothko/obj/PACKAGING/vendor_ramdisk_fragments_intermediates/recovery.cpio.lz4"
-          test -s "$FRAG"
-          SIZE=$(stat -c%s "$FRAG")
-          # With the known stock PLATFORM fragment (40,998,918 B), practical recovery budget is ~25 MiB.
-          echo "recovery_fragment_size=$SIZE" | tee "$GITHUB_WORKSPACE/recovery-fragment-validation.txt"
-          echo "target_max=25500000" | tee -a "$GITHUB_WORKSPACE/recovery-fragment-validation.txt"
-          if [ "$SIZE" -le 25500000 ]; then echo 'stock_platform_fit_candidate=PASS' | tee -a "$GITHUB_WORKSPACE/recovery-fragment-validation.txt"; else echo 'stock_platform_fit_candidate=FAIL' | tee -a "$GITHUB_WORKSPACE/recovery-fragment-validation.txt"; fi
-          sha256sum "$FRAG" | tee "$GITHUB_WORKSPACE/recovery-fragment.sha256"
+          set -exo pipefail
+          OUT="$GITHUB_WORKSPACE/twrp/out/target/product/rothko/vendor_boot.img"
+          test -s "$OUT"
+          SIZE=$(stat -c%s "$OUT")
+          echo "vendor_boot_size=$SIZE" | tee "$GITHUB_WORKSPACE/vendor_boot-validation.txt"
+          echo "partition_limit=67108864" | tee -a "$GITHUB_WORKSPACE/vendor_boot-validation.txt"
+          if [ "$SIZE" -gt 67108864 ]; then
+            echo 'size_check=FAIL' | tee -a "$GITHUB_WORKSPACE/vendor_boot-validation.txt"
+            exit 1
+          fi
+          echo 'size_check=PASS' | tee -a "$GITHUB_WORKSPACE/vendor_boot-validation.txt"
+          sha256sum "$OUT" | tee "$GITHUB_WORKSPACE/vendor_boot.sha256"
+
+      - name: Build FINAL stock-3.0.301 hybrid vendor_boot
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          STOCK="$GITHUB_WORKSPACE/finalwork/stock_vendor_boot.img"
+          PARTS="$GITHUB_WORKSPACE/stock_parts"
+          EXPECTED_STOCK_SHA="7ef19af2b40b21e5b43339cb7260c5ed4db622faadd0554637ee23077fdbd673"
+          # GitHub web upload rejects files over 25 MiB, so the verified 64 MiB stock
+          # vendor_boot is stored as four 16 MiB byte-exact chunks and reconstructed here.
+          test -s "$PARTS/stock_vendor_boot.img.part00"
+          test -s "$PARTS/stock_vendor_boot.img.part01"
+          test -s "$PARTS/stock_vendor_boot.img.part02"
+          test -s "$PARTS/stock_vendor_boot.img.part03"
+          test "$(find "$PARTS" -maxdepth 1 -type f -name 'stock_vendor_boot.img.part*' | wc -l)" -eq 4
+          mkdir -p "$GITHUB_WORKSPACE/finalwork"
+          cat "$PARTS/stock_vendor_boot.img.part00" \
+              "$PARTS/stock_vendor_boot.img.part01" \
+              "$PARTS/stock_vendor_boot.img.part02" \
+              "$PARTS/stock_vendor_boot.img.part03" > "$STOCK"
+          test "$(stat -c%s "$STOCK")" -eq 67108864
+          echo "$EXPECTED_STOCK_SHA  $STOCK" | sha256sum -c -
+          echo 'stock_reassembly=PASS'
+          WORK="$GITHUB_WORKSPACE/finalwork"
+          rm -rf "$WORK" && mkdir -p "$WORK/stockroot" "$WORK/twrproot" "$WORK/slimplat"
+          # Extract the exact stock PLATFORM fragment (entry 0) from OS3.0.301 vendor_boot.
+          python3 - "$STOCK" "$WORK/stock-platform.cpio.lz4" <<'PY'
+          import struct,sys
+          d=open(sys.argv[1],'rb').read(); assert d[:8]==b'VNDRBOOT'
+          ver,page,_,_,vrsz=struct.unpack_from('<5I',d,8); assert ver==4 and page==4096
+          o=28+2048+4+16
+          hs,ds=struct.unpack_from('<II',d,o); o+=8; o+=8
+          ts,en,es,bs=struct.unpack_from('<4I',d,o); assert en==2 and es==108
+          al=lambda x:(x+page-1)//page*page
+          vroff=page; dtoff=vroff+al(vrsz); toff=dtoff+al(ds)
+          sz,off,typ=struct.unpack_from('<III',d,toff)
+          assert typ==1
+          p=d[vroff+off:vroff+off+sz]; assert p[:4]==b'\x02\x21\x4c\x18'
+          open(sys.argv[2],'wb').write(p)
+          print('stock_platform_size=',len(p))
+          PY
+          lz4 -d "$WORK/stock-platform.cpio.lz4" "$WORK/stock-platform.cpio"
+          (cd "$WORK/stockroot" && cpio -idm --no-absolute-filenames < "$WORK/stock-platform.cpio")
+          TWRP_FRAG="$GITHUB_WORKSPACE/twrp/out/target/product/rothko/obj/PACKAGING/vendor_ramdisk_fragments_intermediates/recovery.cpio.lz4"
+          test -s "$TWRP_FRAG"
+          lz4 -d "$TWRP_FRAG" "$WORK/twrp-recovery.cpio"
+          (cd "$WORK/twrproot" && cpio -idm --no-absolute-filenames < "$WORK/twrp-recovery.cpio")
+          # Turn the full TWRP recovery root into an ABI-safe overlay on the stock PLATFORM.
+          python3 "$GITHUB_WORKSPACE/scripts/make_delta.py" "$WORK/stockroot" "$WORK/twrproot" | tee "$GITHUB_WORKSPACE/delta-report.txt"
+          # Any stock PLATFORM regular file supplied by the TWRP overlay would be dead duplicate bytes.
+          cp -a "$WORK/stockroot/." "$WORK/slimplat/"
+          python3 - "$WORK/slimplat" "$WORK/twrproot" <<'PY'
+          import os,stat,sys
+          plat,rec=sys.argv[1:]; n=b=0
+          for base,dirs,files in os.walk(rec):
+            for f in files:
+              r=os.path.join(base,f); rel=os.path.relpath(r,rec); p=os.path.join(plat,rel)
+              try: sr=os.lstat(r); sp=os.lstat(p)
+              except OSError: continue
+              if stat.S_ISREG(sr.st_mode) and stat.S_ISREG(sp.st_mode):
+                os.remove(p); n+=1; b+=sp.st_size
+          print(f'stock_dead_duplicates_removed={n}')
+          print(f'stock_dead_duplicate_bytes_removed={b}')
+          PY
+          # Repack both fragments deterministically as legacy LZ4 HC, matching stock compression.
+          (cd "$WORK/twrproot" && find . -print0 | LC_ALL=C sort -z | cpio --null -o -H newc --owner=0:0 > "$WORK/twrp-delta.cpio")
+          (cd "$WORK/slimplat" && find . -print0 | LC_ALL=C sort -z | cpio --null -o -H newc --owner=0:0 > "$WORK/stock-platform-slim.cpio")
+          lz4 -l -12 -f "$WORK/twrp-delta.cpio" "$WORK/twrp-delta.cpio.lz4"
+          lz4 -l -12 -f "$WORK/stock-platform-slim.cpio" "$WORK/stock-platform-slim.cpio.lz4"
+          echo "slim_platform=$(stat -c%s "$WORK/stock-platform-slim.cpio.lz4")" | tee "$GITHUB_WORKSPACE/final-sizes.txt"
+          echo "twrp_delta=$(stat -c%s "$WORK/twrp-delta.cpio.lz4")" | tee -a "$GITHUB_WORKSPACE/final-sizes.txt"
+          # Rebuild header-v4 container using stock header/cmdline/DTB/table metadata.
+          python3 "$GITHUB_WORKSPACE/scripts/vendorboot_pack.py" "$STOCK" "$WORK/stock-platform-slim.cpio.lz4" "$WORK/twrp-delta.cpio.lz4" "$WORK/vendor_boot_final.img" | tee -a "$GITHUB_WORKSPACE/final-sizes.txt"
+          PRE=$(stat -c%s "$WORK/vendor_boot_final.img")
+          test "$PRE" -lt 67000000
+          # Add a fresh unsigned AVB hash footer for the modified vendor_boot payload.
+          AVB="$GITHUB_WORKSPACE/twrp/out/host/linux-x86/bin/avbtool"
+          test -x "$AVB"
+          "$AVB" add_hash_footer --image "$WORK/vendor_boot_final.img" --partition_size 67108864 --partition_name vendor_boot
+          test "$(stat -c%s "$WORK/vendor_boot_final.img")" -eq 67108864
+          "$AVB" verify_image --image "$WORK/vendor_boot_final.img"
+          "$AVB" info_image --image "$WORK/vendor_boot_final.img" | tee "$GITHUB_WORKSPACE/avb-info.txt"
+          sha256sum "$WORK/vendor_boot_final.img" | tee "$GITHUB_WORKSPACE/vendor_boot_final.sha256"
+          # Structural invariants: v4, two fragments, PLATFORM then RECOVERY, stock DTB and stock cmdline.
+          python3 - "$STOCK" "$WORK/vendor_boot_final.img" <<'PY'
+          import hashlib,struct,sys
+          def parse(p):
+            d=open(p,'rb').read(); assert d[:8]==b'VNDRBOOT'
+            ver,page,ka,ra,vrs=struct.unpack_from('<5I',d,8); assert ver==4 and page==4096
+            cmd=d[28:28+2048]; o=28+2048+4+16
+            hs,ds=struct.unpack_from('<II',d,o);o+=8;da=struct.unpack_from('<Q',d,o)[0];o+=8
+            ts,en,es,bs=struct.unpack_from('<4I',d,o); al=lambda x:(x+page-1)//page*page
+            vr=page; dt=vr+al(vrs); tab=dt+al(ds); ents=[]
+            for i in range(en):
+              e=tab+i*es; sz,off,typ=struct.unpack_from('<III',d,e); name=d[e+12:e+44].split(b'\0',1)[0]
+              payload=d[vr+off:vr+off+sz]; ents.append((sz,typ,name,payload))
+            return cmd,d[dt:dt+ds],ents
+          sc,sd,se=parse(sys.argv[1]); fc,fd,fe=parse(sys.argv[2])
+          assert fc==sc, 'cmdline changed from stock'
+          assert fd==sd, 'DTB changed from stock'
+          assert len(fe)==2 and fe[0][1]==1 and fe[1][1]==2 and fe[1][2]==b'recovery'
+          assert all(x[3][:4]==b'\x02\x21\x4c\x18' for x in fe)
+          print('FINAL_STRUCTURE=PASS')
+          print('stock_dtb_sha256='+hashlib.sha256(sd).hexdigest())
+          print('platform_size='+str(fe[0][0]))
+          print('recovery_size='+str(fe[1][0]))
+          PY
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          cp "$WORK/vendor_boot_final.img" "$GITHUB_WORKSPACE/artifacts/"
+          cp "$WORK/twrp-delta.cpio.lz4" "$GITHUB_WORKSPACE/artifacts/"
+          cp "$WORK/stock-platform-slim.cpio.lz4" "$GITHUB_WORKSPACE/artifacts/"
+          cp "$GITHUB_WORKSPACE/final-sizes.txt" "$GITHUB_WORKSPACE/artifacts/"
+          cp "$GITHUB_WORKSPACE/delta-report.txt" "$GITHUB_WORKSPACE/artifacts/"
+          cp "$GITHUB_WORKSPACE/avb-info.txt" "$GITHUB_WORKSPACE/artifacts/"
+          cp "$GITHUB_WORKSPACE/vendor_boot_final.sha256" "$GITHUB_WORKSPACE/artifacts/"
 
       - name: Collect
         if: always()
         run: |
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          for f in build.log manifest.xml recovery-fragment-validation.txt recovery-fragment.sha256; do
+          for f in build.log manifest.xml vendor_boot-validation.txt vendor_boot.sha256; do
             cp "$GITHUB_WORKSPACE/$f" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
           done
           free -h > "$GITHUB_WORKSPACE/artifacts/memory.txt"
@@ -186,7 +291,7 @@ TW_USE_TOOLBOX := true
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rothko-twrp-build-v26
+          name: rothko-twrp-build-v28-final
           path: artifacts/
           if-no-files-found: warn
           retention-days: 7
