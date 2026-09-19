@@ -29,3 +29,13 @@ before flashing.
   https://github.com/JonesqPacMan/android_device_xiaomi_rothko_twrp
 - Minimal TWRP AOSP manifest:
   https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp
+# Rothko TWRP v28 FINAL
+
+Upload/merge the contents of this ZIP into the repository root.
+
+Required paths:
+- `.github/workflows/build-twrp.yml`
+- `scripts/`
+- `stock_parts/` (4 files, each 16 MiB)
+
+There is no 64 MiB `vendor_boot.img` to upload. The workflow concatenates the four stock chunks in exact order, requires a 67,108,864-byte result, and verifies SHA-256 `7ef19af2b40b21e5b43339cb7260c5ed4db622faadd0554637ee23077fdbd673` before using it.
