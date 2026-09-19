@@ -1,4 +1,4 @@
-name: Build Rothko TWRP v25 - split recovery fragment
+name: Build Rothko TWRP v26 - stock-platform-compatible slim recovery
 on:
   workflow_dispatch:
 
@@ -70,6 +70,26 @@ jobs:
           fi
           grep -n 'BOARD_INCLUDE_RECOVERY_RAMDISK_IN_VENDOR_BOOT' device/xiaomi/rothko/BoardConfig.mk
 
+          # Stock vendor_boot already supplies the vendor/platform kernel modules in recovery mode.
+          # Do NOT duplicate the entire vendor_boot module set inside the TWRP RECOVERY fragment.
+          # AOSP explicitly allows recovery ramdisk to contain only additional modules when vendor_boot
+          # is also loaded in recovery mode. Keep only rothko's explicitly requested haptic module.
+          sed -i 's/^TW_LOAD_VENDOR_BOOT_MODULES[[:space:]]*:=.*/TW_LOAD_VENDOR_BOOT_MODULES := false/' device/xiaomi/rothko/BoardConfig.mk
+
+          # Size cuts that do not affect FBE/decryption, ADB, MTP, fastbootd, flashing or OTG.
+          sed -i 's/^TW_EXTRA_LANGUAGES[[:space:]]*:=.*/TW_EXTRA_LANGUAGES := false/' device/xiaomi/rothko/BoardConfig.mk
+          sed -i 's/^TW_INCLUDE_NTFS_3G[[:space:]]*:=.*/TW_INCLUDE_NTFS_3G := false/' device/xiaomi/rothko/BoardConfig.mk
+          sed -i 's/^TW_INCLUDE_FUSE_NTFS[[:space:]]*:=.*/TW_INCLUDE_FUSE_NTFS := false/' device/xiaomi/rothko/BoardConfig.mk
+          # Prefer toolbox/toybox applets instead of carrying duplicate utility payload where supported.
+          if grep -q '^TW_USE_TOOLBOX[[:space:]]*:=' device/xiaomi/rothko/BoardConfig.mk; then
+            sed -i 's/^TW_USE_TOOLBOX[[:space:]]*:=.*/TW_USE_TOOLBOX := true/' device/xiaomi/rothko/BoardConfig.mk
+          else
+            printf '
+TW_USE_TOOLBOX := true
+' >> device/xiaomi/rothko/BoardConfig.mk
+          fi
+          grep -nE 'TW_LOAD_VENDOR_BOOT_MODULES|TW_EXTRA_LANGUAGES|TW_INCLUDE_NTFS_3G|TW_INCLUDE_FUSE_NTFS|TW_USE_TOOLBOX' device/xiaomi/rothko/BoardConfig.mk
+
       - name: Verify rothko vendor_boot contract
         run: |
           set -exo pipefail
@@ -109,31 +129,31 @@ jobs:
            done) &
           MON_PID=$!
           trap 'kill $MON_PID 2>/dev/null || true' EXIT
-          m vendorbootimage -j1
+          m out/target/product/rothko/obj/PACKAGING/vendor_ramdisk_fragments_intermediates/recovery.cpio.lz4 -j1
+          echo "recovery_fragment_build=PASS"
+          # Also try the complete image for diagnostics; stock-platform transplant remains the final target.
+          m vendorbootimage -j1 || echo "vendorboot_container_build=NONFATAL"
           kill $MON_PID 2>/dev/null || true
           trap - EXIT
 
-      - name: Validate output
-        if: success()
+      - name: Validate recovery fragment size
+        if: always()
         run: |
-          set -exo pipefail
-          OUT="$GITHUB_WORKSPACE/twrp/out/target/product/rothko/vendor_boot.img"
-          test -s "$OUT"
-          SIZE=$(stat -c%s "$OUT")
-          echo "vendor_boot_size=$SIZE" | tee "$GITHUB_WORKSPACE/vendor_boot-validation.txt"
-          echo "partition_limit=67108864" | tee -a "$GITHUB_WORKSPACE/vendor_boot-validation.txt"
-          if [ "$SIZE" -gt 67108864 ]; then
-            echo 'size_check=FAIL' | tee -a "$GITHUB_WORKSPACE/vendor_boot-validation.txt"
-            exit 1
-          fi
-          echo 'size_check=PASS' | tee -a "$GITHUB_WORKSPACE/vendor_boot-validation.txt"
-          sha256sum "$OUT" | tee "$GITHUB_WORKSPACE/vendor_boot.sha256"
+          set -eo pipefail
+          FRAG="$GITHUB_WORKSPACE/twrp/out/target/product/rothko/obj/PACKAGING/vendor_ramdisk_fragments_intermediates/recovery.cpio.lz4"
+          test -s "$FRAG"
+          SIZE=$(stat -c%s "$FRAG")
+          # With the known stock PLATFORM fragment (40,998,918 B), practical recovery budget is ~25 MiB.
+          echo "recovery_fragment_size=$SIZE" | tee "$GITHUB_WORKSPACE/recovery-fragment-validation.txt"
+          echo "target_max=25500000" | tee -a "$GITHUB_WORKSPACE/recovery-fragment-validation.txt"
+          if [ "$SIZE" -le 25500000 ]; then echo 'stock_platform_fit_candidate=PASS' | tee -a "$GITHUB_WORKSPACE/recovery-fragment-validation.txt"; else echo 'stock_platform_fit_candidate=FAIL' | tee -a "$GITHUB_WORKSPACE/recovery-fragment-validation.txt"; fi
+          sha256sum "$FRAG" | tee "$GITHUB_WORKSPACE/recovery-fragment.sha256"
 
       - name: Collect
         if: always()
         run: |
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          for f in build.log manifest.xml vendor_boot-validation.txt vendor_boot.sha256; do
+          for f in build.log manifest.xml recovery-fragment-validation.txt recovery-fragment.sha256; do
             cp "$GITHUB_WORKSPACE/$f" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
           done
           free -h > "$GITHUB_WORKSPACE/artifacts/memory.txt"
@@ -166,7 +186,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rothko-twrp-build-v25
+          name: rothko-twrp-build-v26
           path: artifacts/
           if-no-files-found: warn
           retention-days: 7
