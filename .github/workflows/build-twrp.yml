@@ -1,4 +1,4 @@
-name: Build Rothko TWRP v22 - native TWRP 16
+name: Build Rothko TWRP v23 - native TWRP 16
 on:
   workflow_dispatch:
 
@@ -12,14 +12,27 @@ jobs:
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
           df -h /
 
-      - name: Add swap
+      - name: Configure memory for Soong graph generation
         run: |
+          set -eo pipefail
+          # TWRP 16 builders that run on GitHub-hosted runners use zram because
+          # soong_build graph generation can consume nearly all physical RAM.
           sudo swapoff -a || true
+          sudo apt-get update
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)" zram-tools
+          sudo modprobe zram
+          sudo sed -i 's/^#\?PERCENT=.*/PERCENT=90/' /etc/default/zramswap
+          sudo sed -i 's/^#\?PRIORITY=.*/PRIORITY=1000/' /etc/default/zramswap
+          sudo systemctl restart zramswap
+          # Keep a lower-priority disk swap behind zram as a safety net.
           sudo fallocate -l 8G /swapfile
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile
-          sudo swapon /swapfile
+          sudo swapon -p 10 /swapfile
+          echo '=== memory configuration ==='
           free -h
+          zramctl || true
+          swapon --show --bytes || true
 
       - name: Restore TWRP16 compiler cache
         id: ccache-cache
@@ -34,6 +47,120 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git git-lfs gnupg gperf imagemagick lib32ncurses-dev lib32readline-dev lib32z1-dev libelf-dev liblz4-tool libncurses-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lz4 lzop pngcrush repo rsync schedtool squashfs-tools xsltproc zip zlib1g-dev python3 python-is-python3
+
+      - name: Sync native TWRP 16 source and rothko tree
+        run: |
+          set -exo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/twrp"
+          cd "$GITHUB_WORKSPACE/twrp"
+          repo init --depth=1 -u https://github.com/TWRP-Test/platform_manifest_twrp_aosp.git -b twrp-16.0
+          repo sync -c --no-clone-bundle --no-tags --optimized-fetch --prune -j2
+          mkdir -p device/xiaomi
+          rm -rf device/xiaomi/rothko
+          git clone --depth=1 -b twrp-14.1_a16 https://github.com/JonesqPacMan/android_device_xiaomi_rothko_twrp.git device/xiaomi/rothko
+          repo manifest -r > "$GITHUB_WORKSPACE/manifest.xml"
+          echo "recovery_head=$(git -C bootable/recovery rev-parse HEAD)"
+          echo "rothko_head=$(git -C device/xiaomi/rothko rev-parse HEAD)"
+
+      - name: Verify rothko vendor_boot contract
+        run: |
+          set -exo pipefail
+          cd "$GITHUB_WORKSPACE/twrp"
+          grep -q 'TARGET_NO_RECOVERY.*true' device/xiaomi/rothko/BoardConfig.mk
+          grep -q 'BOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT.*true' device/xiaomi/rothko/BoardConfig.mk
+          grep -q 'BOARD_VENDOR_BOOTIMAGE_PARTITION_SIZE.*67108864' device/xiaomi/rothko/BoardConfig.mk
+          grep -q 'TW_INCLUDE_CRYPTO.*true' device/xiaomi/rothko/BoardConfig.mk
+          grep -q 'TW_INCLUDE_CRYPTO_FBE.*true' device/xiaomi/rothko/BoardConfig.mk
+          echo 'rothko_vendor_boot_contract=PASS'
+
+      - name: Build TWRP with live memory telemetry
+        id: build1
+        shell: bash
+        run: |
+          set -eo pipefail
+          cd "$GITHUB_WORKSPACE/twrp"
+          export ALLOW_MISSING_DEPENDENCIES=true USE_CCACHE=1 CCACHE_EXEC=/usr/bin/ccache
+          export CCACHE_DIR="$HOME/.cache/ccache" CCACHE_MAXSIZE=4G OUT_DIR=out
+          export GOMAXPROCS=1 NINJA_ARGS="-j1" SOONG_UI_NINJA_ARGS="-j1"
+          ccache -M 4G || true
+          source build/envsetup.sh
+          exec > >(tee -a "$GITHUB_WORKSPACE/build.log") 2>&1
+          lunch twrp_rothko bp2a eng
+          test "${TARGET_PRODUCT:-}" = twrp_rothko
+          test "${TARGET_RELEASE:-}" = bp2a
+          test "${TARGET_BUILD_VARIANT:-}" = eng
+          echo 'release_environment_check=PASS'
+          # Emit telemetry into the live Actions log. If the runner kills the job,
+          # the last sample remains visible even though later artifact steps cannot run.
+          (while true; do
+             echo "=== MEM $(date -u +%H:%M:%S) ==="
+             free -h
+             swapon --show || true
+             zramctl || true
+             sleep 10
+           done) &
+          MON_PID=$!
+          trap 'kill $MON_PID 2>/dev/null || true' EXIT
+          m vendorbootimage -j1
+          kill $MON_PID 2>/dev/null || true
+          trap - EXIT
+
+      - name: Validate output
+        if: success()
+        run: |
+          set -exo pipefail
+          OUT="$GITHUB_WORKSPACE/twrp/out/target/product/rothko/vendor_boot.img"
+          test -s "$OUT"
+          SIZE=$(stat -c%s "$OUT")
+          echo "vendor_boot_size=$SIZE" | tee "$GITHUB_WORKSPACE/vendor_boot-validation.txt"
+          echo "partition_limit=67108864" | tee -a "$GITHUB_WORKSPACE/vendor_boot-validation.txt"
+          if [ "$SIZE" -gt 67108864 ]; then
+            echo 'size_check=FAIL' | tee -a "$GITHUB_WORKSPACE/vendor_boot-validation.txt"
+            exit 1
+          fi
+          echo 'size_check=PASS' | tee -a "$GITHUB_WORKSPACE/vendor_boot-validation.txt"
+          sha256sum "$OUT" | tee "$GITHUB_WORKSPACE/vendor_boot.sha256"
+
+      - name: Collect
+        if: always()
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          for f in build.log manifest.xml vendor_boot-validation.txt vendor_boot.sha256; do
+            cp "$GITHUB_WORKSPACE/$f" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
+          done
+          free -h > "$GITHUB_WORKSPACE/artifacts/memory.txt"
+          swapon --show > "$GITHUB_WORKSPACE/artifacts/swap.txt" || true
+          df -h > "$GITHUB_WORKSPACE/artifacts/disk.txt"
+          CCACHE_DIR="$HOME/.cache/ccache" ccache -s > "$GITHUB_WORKSPACE/artifacts/ccache-stats.txt" 2>&1 || true
+          OUT="$GITHUB_WORKSPACE/twrp/out/target/product/rothko"
+          if [ -s "$OUT/vendor_boot.img" ]; then
+            cp "$OUT/vendor_boot.img" "$GITHUB_WORKSPACE/artifacts/"
+          fi
+          find "$OUT" -maxdepth 5 -type f \( -name 'vendor_boot.img' -o -name '*ramdisk*' -o -name '*.cpio' -o -name '*.lz4' \) -print > "$GITHUB_WORKSPACE/artifacts/output-files.txt" 2>/dev/null || true
+
+      - name: Free build output before cache save
+        if: always()
+        run: |
+          df -h /
+          rm -rf "$GITHUB_WORKSPACE/twrp/out"
+          sudo rm -f /swapfile || true
+          df -h /
+
+      - name: Save TWRP16 compiler cache even on failure
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/ccache
+          key: rothko-twrp16-ccache-${{ runner.os }}-${{ github.run_id }}
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rothko-twrp-build-v23
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Sync native TWRP 16 source and rothko tree
         run: |
